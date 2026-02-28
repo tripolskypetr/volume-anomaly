@@ -87,13 +87,31 @@ describe('bocpdUpdate', () => {
 describe('bocpdAnomalyScore', () => {
   it('returns value in [0,1]', () => {
     let s = bocpdInitState();
+    let prev = 0;
     for (let i = 0; i < 10; i++) {
-      const r = bocpdUpdate(s, Math.random(), PRIOR);
-      const score = bocpdAnomalyScore(r);
+      const r     = bocpdUpdate(s, Math.random(), PRIOR);
+      const score = bocpdAnomalyScore(r, prev);
       expect(score).toBeGreaterThanOrEqual(0);
       expect(score).toBeLessThanOrEqual(1);
-      s = r.state;
+      prev = r.mapRunLength;
+      s    = r.state;
     }
+  });
+
+  it('scores high on large run-length drop (changepoint reset)', () => {
+    // Simulate: prevRunLength = 50, then mapRunLength resets to 1
+    const fakeResult = { mapRunLength: 1, cpProbability: 0.2, state: bocpdInitState() };
+    const score = bocpdAnomalyScore(fakeResult, 50);
+    // drop = (50 - 1) / 50 = 0.98 → score ≈ 0.98
+    expect(score).toBeGreaterThan(0.9);
+  });
+
+  it('scores near 0 on stable growing run length', () => {
+    // Simulate: prevRunLength = 10, then mapRunLength grows to 11 (no drop)
+    const fakeResult = { mapRunLength: 11, cpProbability: 0.005, state: bocpdInitState() };
+    const score = bocpdAnomalyScore(fakeResult, 10);
+    // drop = (10 - 11) / 10 = -0.1 → score < 0.15
+    expect(score).toBeLessThan(0.15);
   });
 });
 

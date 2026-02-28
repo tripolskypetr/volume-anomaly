@@ -165,20 +165,21 @@ export class VolumeAnomalyDetector {
     const cusumScore = peakCusumScore;
 
     // ── 4. BOCPD on |imbalance| rolling series — same space as training prior.
-    // Track the peak cpProbability seen during the run.  bocpdAnomalyScore
-    // normalises by the prior hazard H = 1/hazardLambda, so only cpProbability
-    // meaningfully above the prior (i.e. real evidence for a changepoint) lifts
-    // the score.  Taking the peak over the window captures changepoints that
-    // occurred earlier and whose cpProbability has since decayed.
-    let bocpdResult = { mapRunLength: 0, cpProbability: 0, state: bocpdInitState() };
-    let bestBocpdResult = bocpdResult;
+    // cpProbability is always ≈ H = 1/hazardLambda (a prior constant) and does
+    // not spike at a genuine changepoint.  The real signal is mapRunLength: in
+    // a stable process it grows monotonically; a changepoint resets it to ≈ 0.
+    // bocpdAnomalyScore measures the relative drop from the previous step, so
+    // a reset from 90 → 1 scores ≈ 1 while gradual growth scores near 0.
+    // We take the peak score over the window to catch changepoints that
+    // happened before the last observation.
+    let bocpdResult  = { mapRunLength: 0, cpProbability: 0, state: bocpdInitState() };
+    let bocpdScore   = 0;
     for (const v of absImbSeries) {
-      bocpdResult = bocpdUpdate(bocpdResult.state, v, bocpdPrior, this.cfg.hazardLambda);
-      if (bocpdResult.cpProbability > bestBocpdResult.cpProbability) {
-        bestBocpdResult = bocpdResult;
-      }
+      const prevRL = bocpdResult.mapRunLength;
+      bocpdResult  = bocpdUpdate(bocpdResult.state, v, bocpdPrior, this.cfg.hazardLambda);
+      const s      = bocpdAnomalyScore(bocpdResult, prevRL);
+      if (s > bocpdScore) bocpdScore = s;
     }
-    const bocpdScore = bocpdAnomalyScore(bestBocpdResult, this.cfg.hazardLambda);
 
     // ── 5. Combine scores
     const combined = wH! * hawkesScore + wC! * cusumScore + wB! * bocpdScore;
