@@ -75,6 +75,52 @@ interface DetectionResult {
 
 ---
 
+### `predict(historical, recent, confidence?, imbalanceThreshold?)`
+
+One-shot convenience function. Wraps `detect()` and adds a directional signal derived from `imbalance`.
+
+```typescript
+import { predict } from 'volume-anomaly';
+
+const result = predict(historical, recent, 0.75, 0.3);
+// {
+//   anomaly:    true,
+//   confidence: 0.81,
+//   direction:  'long',    // 'long' | 'short' | 'neutral'
+//   imbalance:  0.72,
+// }
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `historical` | `IAggregatedTradeData[]` | required | Baseline window for training (≥ 50 trades) |
+| `recent` | `IAggregatedTradeData[]` | required | Window to evaluate |
+| `confidence` | `number` | `0.75` | Anomaly threshold [0,1] |
+| `imbalanceThreshold` | `number` | `0.3` | Minimum `\|imbalance\|` required to emit `long` or `short`. Below this the direction is `neutral` even when `anomaly = true` |
+
+**Direction logic:**
+
+```
+direction = 'long'    if anomaly && imbalance >  +imbalanceThreshold
+direction = 'short'   if anomaly && imbalance < −imbalanceThreshold
+direction = 'neutral' otherwise (no anomaly, or balanced flow)
+```
+
+**Returns:** `PredictionResult`
+
+```typescript
+interface PredictionResult {
+  anomaly:    boolean;    // confidence >= threshold
+  confidence: number;     // composite score [0,1]
+  direction:  Direction;  // 'long' | 'short' | 'neutral'
+  imbalance:  number;     // buy/sell balance [-1, +1]
+}
+```
+
+---
+
 ### `new VolumeAnomalyDetector(config?)`
 
 Stateful class. Use when you need to re-use fitted models across multiple `detect()` calls without re-training, or when you want to tune individual model parameters.
@@ -232,15 +278,40 @@ T    = t_n − t_0          (observation window length)
 
 Constraints enforced inside the objective: if `μ ≤ 0` or `α ≤ 0` or `β ≤ 0` or `α ≥ β`, return `1e10` (hard wall). This keeps the optimizer in the subcritical stationary region.
 
-**Anomaly score — sigmoid centred at 2× unconditional mean:**
+**Peak intensity over the detection window:**
+
+Instead of evaluating λ at the last event only, the detector takes the **maximum** λ(tᵢ) seen at any event in the window using the same O(n) recursive trick:
 
 ```
-meanLambda = μ / (1 − α/β)
-score_hawkes = σ(2 · (λ(t_last) / meanLambda − 2))
-            = 1 / (1 + exp(−2 · (λ / meanLambda − 2)))
+A(0) = 0
+A(i) = exp(−β · (tᵢ − tᵢ₋₁)) · (1 + A(i−1))
+λ(tᵢ) = μ + α · A(i)
+
+peakLambda = max over i of λ(tᵢ)
 ```
 
-The sigmoid is centred so that `score = 0.5` when `λ = 2 · meanLambda` (twice the expected quiet rate). At `λ = meanLambda` (normal) the score is `1/(1+e⁴) ≈ 0.018`. At `λ = 3·meanLambda` the score is `1/(1+e⁻²) ≈ 0.88`.
+This ensures that a burst occurring in the middle of the window is detected even after the kernel has decayed by the last event.
+
+**Anomaly score — two signals combined via max:**
+
+```
+meanLambda   = μ / (1 − α/β)
+empiricalRate = n / windowDuration          (events/sec in detection window)
+
+sig(ratio) = 1 / (1 + exp(−(ratio − 2) · 2))
+
+intensityScore = sig(peakLambda / meanLambda)
+rateScore      = sig(empiricalRate / μ)      (0 if empiricalRate not provided)
+
+score_hawkes = max(intensityScore, rateScore)
+```
+
+The sigmoid is centred at `ratio = 2` (twice the baseline), so:
+- ratio = 1 (baseline rate) → score ≈ 0.018
+- ratio = 2 (2× baseline) → score = 0.50
+- ratio = 3 (3× baseline) → score ≈ 0.88
+
+Two complementary signals are combined with `max()`: **intensity ratio** captures self-excitation bursts when the fitted branching ratio is significant; **empirical rate ratio** fires even when MLE assigns α ≈ 0 (Poisson baseline) — a 1000× arrival surge is clearly anomalous regardless of the branching structure.
 
 If the fitted branching ratio `α/β ≥ 1`, the process is supercritical and the score is clamped to `1` unconditionally.
 
@@ -360,13 +431,24 @@ After each update, all log-probs are normalised by subtracting `logSumExp(all)`.
 - `cpProbability = P(rₜ = 0 | x₁:ₜ)` — probability that a changepoint occurred exactly at observation t
 - `mapRunLength` — the run length with highest posterior probability (MAP estimator)
 
-**BOCPD anomaly score:**
+**BOCPD anomaly score — relative run-length drop:**
+
+`cpProbability` is approximately equal to the constant prior hazard `H = 1/hazardLambda` and does **not** spike at genuine changepoints — it is dominated by the prior, not the data. The real signal is `mapRunLength`: in a stable process it grows monotonically; a changepoint resets it to near zero.
+
+The score measures the *relative drop* from the previous step:
 
 ```
-score_bocpd = min(cpProbability · 5,  1)
+drop = clamp((prevRunLength − mapRunLength) / prevRunLength,  0, 1)
+
+score_bocpd = 1 / (1 + exp(−(drop − 0.5) · 8))
 ```
 
-The ×5 amplifier compensates for the fact that `cpProbability` is typically small even during genuine changepoints (the model distributes probability across many run-length hypotheses). Empirically, `cpProbability = 0.1–0.2` at a real changepoint, so ×5 maps that to `0.5–1.0`. The `min(..., 1)` caps it.
+Typical values:
+- drop = 0 (run length grew — stable)     → score ≈ 0.018
+- drop = 0.5 (run length halved)          → score = 0.50
+- drop ≥ 0.9 (e.g. 90 → 1 after reset)   → score ≈ 0.98
+
+The sigmoid is centred at `drop = 0.5` with steepness 8. The score is taken as the **peak over the entire detection window**, so changepoints that occurred mid-window are still captured.
 
 **What BOCPD captures:** regime shifts — moments where the *distribution* of imbalance itself changes, not just its current level. A market transitioning from choppy balanced flow to sustained directional flow will register here, often before the imbalance crosses an absolute threshold.
 
@@ -391,10 +473,10 @@ anomaly = confidence_score >= confidence_threshold
 
 | Signal kind | Fires when | Score attached |
 |-------------|-----------|----------------|
-| `volume_spike` | `score_hawkes > 0.5` | Hawkes sigmoid value |
+| `volume_spike` | `score_hawkes > 0.5` | Hawkes max(intensityScore, rateScore) |
 | `imbalance_shift` | `\|imbalance\| > 0.4` | Raw absolute imbalance |
-| `cusum_alarm` | `score_cusum > 0.7` | Linear ratio S/h |
-| `bocpd_changepoint` | `score_bocpd > 0.3` | Amplified CP probability |
+| `cusum_alarm` | `score_cusum > 0.7` | Linear ratio max(S⁺, S⁻) / h |
+| `bocpd_changepoint` | `score_bocpd > 0.3` | Sigmoid of relative run-length drop |
 
 A signal in `result.signals` does **not** require `result.anomaly = true`. You can have partial signals (e.g. only Hawkes firing) with `confidence_score < threshold`. The signals let you understand *why* the composite score is what it is.
 
@@ -458,7 +540,7 @@ Evaluates `λ(t)` at a specific time given a history of prior events. All timest
 
 ### `cusumUpdate(state, x, params)`
 
-Pure function. Returns `{ state: CusumState, alarm: boolean }`. Does **not** mutate the input state.
+Pure function. Returns `{ state: CusumState, alarm: boolean, preResetState: CusumState }`. Does **not** mutate the input state. `preResetState` holds the accumulator values *before* the alarm reset — use it for scoring, since `state.sPos/sNeg` are zeroed when `alarm = true`.
 
 ### `bocpdUpdate(state, x, prior, hazardLambda?)`
 
@@ -553,14 +635,21 @@ async function onCandle(candles: Candle[], recentTrades: IAggregatedTradeData[])
 
 ## Tests
 
-**59 tests** across **4 test files**. All passing.
+**351 tests** across **11 test files**. All passing.
 
 | File | Tests | Coverage |
 |------|-------|----------|
 | `hawkes.test.ts` | 20 | Imbalance formula, LL computation, MLE fitting, λ evaluation and decay, anomaly score monotonicity and supercritical clamp |
 | `cusum.test.ts` | 15 | Parameter estimation, state update (pure function), accumulation, alarm + reset, score range, batch detection |
-| `bocpd.test.ts` | 11 | Init state, t increment, probability normalisation, run length growth in stable regime, CP spike on distribution shift, immutability, batch changepoint detection |
-| `detector.test.ts` | 13 | Pre-train guard, isTrained flag, minimum training size, DetectionResult fields, confidence range, empty window, signal score range, functional API determinism |
+| `bocpd.test.ts` | 13 | Init state, t increment, probability normalisation, run length growth in stable regime, CP spike on distribution shift, immutability, batch changepoint detection |
+| `detector.test.ts` | 20 | Pre-train guard, isTrained flag, minimum training size, DetectionResult fields, confidence range, empty window, signal score range, functional API determinism |
+| `detect.test.ts` | 36 | End-to-end anomaly detection, confidence thresholds, signal composition, edge inputs |
+| `seeded.test.ts` | 67 | Deterministic seeded scenarios covering long/short/neutral bursts across parameter space |
+| `predict.test.ts` | 16 | Direction assignment, imbalanceThreshold logic, long/short/neutral cases |
+| `invariants.test.ts` | 29 | Monotonicity, score bounds, immutability, score weight validation |
+| `adversarial.test.ts` | 58 | Adversarial inputs: NaN propagation, extreme values, Inf timestamps, zero-qty trades |
+| `falsepositive.test.ts` | 18 | Scenarios that must NOT trigger: gradual drift, HFT clusters, trending market, whale trades, overnight gaps |
+| `edgecases.test.ts` | 59 | Boundary conditions, empty arrays, signal threshold exact values, BOCPD pruning, regression for NaN bug |
 
 ```bash
 npm test
