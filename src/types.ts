@@ -14,6 +14,27 @@ export interface IAggregatedTradeData {
   isBuyerMaker: boolean;
 }
 
+// ─── Prediction result ───────────────────────────────────────────────────────
+
+/** Trade direction inferred from order-flow imbalance. */
+export type Direction = 'long' | 'short' | 'neutral';
+
+export interface PredictionResult {
+  /** true when combined confidence ≥ requested threshold */
+  anomaly:    boolean;
+  /** Composite anomaly score [0,1] */
+  confidence: number;
+  /**
+   * Directional signal derived from imbalance:
+   * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression)
+   * - `'short'`   — anomaly + imbalance < −imbalanceThreshold (sell aggression)
+   * - `'neutral'` — no anomaly, or anomaly with balanced order flow (rate-only spike)
+   */
+  direction:  Direction;
+  /** Signed imbalance [-1,+1]. Positive = buy-side pressure. */
+  imbalance:  number;
+}
+
 // ─── Detection result ─────────────────────────────────────────────────────────
 
 export type AnomalyKind =

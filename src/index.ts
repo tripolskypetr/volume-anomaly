@@ -26,12 +26,14 @@ export type {
   DetectionResult,
   AnomalySignal,
   AnomalyKind,
+  Direction,
+  PredictionResult,
 } from './types.js';
 
 // ─── Functional one-shot API ──────────────────────────────────────────────────
 
 import { VolumeAnomalyDetector } from './detector.js';
-import type { IAggregatedTradeData, DetectionResult } from './types.js';
+import type { IAggregatedTradeData, DetectionResult, Direction, PredictionResult } from './types.js';
 
 /**
  * Convenience function: train + detect in one call.
@@ -48,4 +50,39 @@ export function detect(
   const detector = new VolumeAnomalyDetector();
   detector.train(historical);
   return detector.detect(recent, confidence);
+}
+
+/**
+ * One-shot anomaly detection with directional signal.
+ *
+ * Wraps `detect()` and adds a `direction` field derived from `imbalance`:
+ * - `'long'`    — anomaly detected + buy-side order flow dominates
+ * - `'short'`   — anomaly detected + sell-side order flow dominates
+ * - `'neutral'` — no anomaly, or anomaly is a pure rate spike with balanced flow
+ *
+ * @param historical          Baseline window (≥ 50 trades) for model training.
+ * @param recent              Recent window to evaluate.
+ * @param confidence          Anomaly threshold [0,1]. Default 0.75.
+ * @param imbalanceThreshold  Minimum |imbalance| to assign long/short. Default 0.3.
+ */
+export function predict(
+  historical:          IAggregatedTradeData[],
+  recent:              IAggregatedTradeData[],
+  confidence:          number = 0.75,
+  imbalanceThreshold:  number = 0.3,
+): PredictionResult {
+  const r = detect(historical, recent, confidence);
+
+  let direction: Direction = 'neutral';
+  if (r.anomaly) {
+    if (r.imbalance >  imbalanceThreshold) direction = 'long';
+    else if (r.imbalance < -imbalanceThreshold) direction = 'short';
+  }
+
+  return {
+    anomaly:    r.anomaly,
+    confidence: r.confidence,
+    direction,
+    imbalance:  r.imbalance,
+  };
 }
