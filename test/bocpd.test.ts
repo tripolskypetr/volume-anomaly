@@ -106,8 +106,8 @@ describe('bocpdBatch', () => {
   });
 
   it('detects regime change: cpProb elevated after mean shift', () => {
-    const stable = Array.from({ length: 100 }, () => 0 + Math.random() * 0.05);
-    const shift  = Array.from({ length: 20  }, () => 5 + Math.random() * 0.05);
+    const stable = Array.from({ length: 100 }, (_, i) => 0.02 + (i % 5) * 0.005);
+    const shift  = Array.from({ length: 20  }, (_, i) => 5.02 + (i % 5) * 0.005);
     const series = [...stable, ...shift];
 
     const prior = defaultPrior(0, 0.01);
