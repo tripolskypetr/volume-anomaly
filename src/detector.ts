@@ -164,12 +164,20 @@ export class VolumeAnomalyDetector {
     }
     const cusumScore = peakCusumScore;
 
-    // ── 4. BOCPD on |imbalance| rolling series — same space as training prior
+    // ── 4. BOCPD on |imbalance| rolling series — same space as training prior.
+    // bocpdAnomalyScore uses exp(−mapRunLength/10): score is highest right
+    // after a changepoint (mapRunLength ≈ 0..1) and decays as the new run
+    // grows.  We track the minimum mapRunLength seen after the first step to
+    // capture changepoints that occurred earlier in the window.
     let bocpdResult = { mapRunLength: 0, cpProbability: 0, state: bocpdInitState() };
+    let bestBocpdResult = bocpdResult;
     for (const v of absImbSeries) {
       bocpdResult = bocpdUpdate(bocpdResult.state, v, bocpdPrior, this.cfg.hazardLambda);
+      if (bocpdAnomalyScore(bocpdResult) > bocpdAnomalyScore(bestBocpdResult)) {
+        bestBocpdResult = bocpdResult;
+      }
     }
-    const bocpdScore = bocpdAnomalyScore(bocpdResult);
+    const bocpdScore = bocpdAnomalyScore(bestBocpdResult);
 
     // ── 5. Combine scores
     const combined = wH! * hawkesScore + wC! * cusumScore + wB! * bocpdScore;

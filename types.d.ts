@@ -123,7 +123,7 @@ interface DetectorConfig {
     hazardLambda?: number;
     /** CUSUM k multiplier in σ units (default 0.5σ). */
     cusumKSigmas?: number;
-    /** CUSUM h alarm threshold in σ units (default 4σ). */
+    /** CUSUM h alarm threshold in σ units (default 5σ, ARL₀ ≈ 148). */
     cusumHSigmas?: number;
     /**
      * Weights for combining sub-detector scores into a final confidence.
@@ -139,8 +139,6 @@ interface TrainedModels {
 declare class VolumeAnomalyDetector {
     private readonly cfg;
     private models;
-    private cusumState;
-    private bocpdState;
     constructor(config?: DetectorConfig);
     /**
      * Fit all models to historical (in-control) trade data.
@@ -152,12 +150,9 @@ declare class VolumeAnomalyDetector {
      *
      * @param trades     Recent trades (e.g. last 200–500 trades).
      * @param confidence Required confidence threshold [0,1]. Default 0.75.
-     *
-     * This is a **snapshot** call — does not carry state between calls.
-     * For streaming (sequential) use, call detectNext() per-trade instead.
      */
     detect(trades: IAggregatedTradeData[], confidence?: number): DetectionResult;
-    private rollingImbalance;
+    private rollingAbsImbalance;
     private emptyResult;
     get isTrained(): boolean;
     /** Expose fitted parameters (for debugging / serialization) */

@@ -185,11 +185,29 @@ export function bocpdUpdate(
 // ─── Score ────────────────────────────────────────────────────────────────────
 
 /**
- * Anomaly score [0,1]: how confident the model is that a changepoint just occurred.
- * Short run lengths also contribute (fresh start after a change).
+ * Anomaly score [0,1]: how likely a changepoint occurred recently.
+ *
+ * cpProbability alone is insufficient: its steady-state value equals the prior
+ * hazard H = 1/λ regardless of how surprising the data is.
+ *
+ * Instead we use the MAP run length relative to the expected gap between
+ * changepoints (hazardLambda).  In a stable process the MAP run length grows
+ * toward hazardLambda; a fresh changepoint resets it to 0.  The score is
+ * therefore highest just after a reset and decays as the new run grows:
+ *
+ *   score = exp(−mapRunLength / halfLife)
+ *
+ * where halfLife = hazardLambda / 4 so that at one quarter of the expected
+ * changepoint gap the score has already decayed to ~0.37.  This ensures that
+ * at steady state (mapRunLength ≈ hazardLambda) the score is near zero, while
+ * a fresh reset (mapRunLength ≈ 0..5) gives a score close to 1.
+ *
+ * @param result        Output from bocpdUpdate.
+ * @param hazardLambda  Expected gap between changepoints (same as passed to bocpdUpdate).
  */
-export function bocpdAnomalyScore(result: BocpdUpdateResult): number {
-  return Math.min(result.cpProbability * 5, 1); // amplify; CP prob is often small
+export function bocpdAnomalyScore(result: BocpdUpdateResult, hazardLambda = 200): number {
+  const halfLife = Math.max(hazardLambda / 4, 1);
+  return Math.exp(-result.mapRunLength / halfLife);
 }
 
 // ─── Batch ────────────────────────────────────────────────────────────────────

@@ -426,10 +426,19 @@ describe('seeded integration — known anomaly position', () => {
     const CALM:    StreamSegment = { count: 0,   intervalMs: 1000, buyFraction: 0.5,  jitter: 0.3 };
     const ANOMALY: StreamSegment = { count: 200, intervalMs: 100,  buyFraction: 0.9,  jitter: 0.1 };
 
-    const hist    = buildStream([{ ...CALM, count: 500 }], 0,         rng);
-    const pre     = buildStream([{ ...CALM, count: 150 }], 500_000,   rng);
-    const anomaly = buildStream([ANOMALY],                 650_000,   rng);
-    const post    = buildStream([{ ...CALM, count: 150 }], 670_000,   rng);
+    const hist = buildStream([{ ...CALM, count: 500 }], 0, rng);
+    const pre  = buildStream([{ ...CALM, count: 150 }], 500_000, rng);
+
+    // The anomaly window starts with 50 calm trades so that BOCPD can observe
+    // the transition from baseline to burst — an all-anomaly window gives BOCPD
+    // no baseline to compare against and it correctly reports run-length > 0
+    // (stable new regime) rather than a fresh changepoint.
+    const anomaly = buildStream(
+      [{ ...CALM, count: 50 }, ANOMALY],
+      650_000,
+      rng,
+    );
+    const post = buildStream([{ ...CALM, count: 150 }], 720_000, rng);
 
     // ── Train on calm history ──────────────────────────────────────────────
     const detector = new VolumeAnomalyDetector({ windowSize: 20 });
