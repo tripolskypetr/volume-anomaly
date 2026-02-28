@@ -39,7 +39,7 @@ export interface DetectionResult {
   signals:        AnomalySignal[];
   /** Estimated imbalance [-1,+1]: positive = buy pressure */
   imbalance:      number;
-  /** Hawkes conditional intensity at last observed trade */
+  /** Peak Hawkes conditional intensity λ(tᵢ) seen across all trades in the detection window */
   hawkesLambda:   number;
   /** CUSUM statistic (+ side) at last observation */
   cusumStat:      number;

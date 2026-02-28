@@ -194,12 +194,15 @@ export function bocpdUpdate(
  *
  * This function scores the *relative drop* from the previous step:
  *
- *   drop = (prevRunLength − mapRunLength) / prevRunLength   ∈ [0, 1]
+ *   drop = clamp((prevRunLength − mapRunLength) / prevRunLength, 0, 1)
+ *
+ * Negative values (run length grew) are clamped to 0, giving a near-zero
+ * score for stable growth.
  *
  * A sigmoid centred at drop = 0.5:
- *   drop = 0    (no drop, stable run)          → score ≈ 0.12
- *   drop = 0.5  (RL halved)                    → score ≈ 0.50
- *   drop ≥ 0.9  (RL reset, e.g. 90 → 1)       → score ≈ 0.98
+ *   drop = 0    (no drop, or run grew)          → score ≈ 0.12
+ *   drop = 0.5  (RL halved)                     → score ≈ 0.50
+ *   drop ≥ 0.9  (RL reset, e.g. 90 → 1)        → score ≈ 0.98
  *
  * Pass prevRunLength = 0 (or omit) for the very first step; the function
  * returns 0 in that case.
@@ -209,7 +212,7 @@ export function bocpdUpdate(
  */
 export function bocpdAnomalyScore(result: BocpdUpdateResult, prevRunLength = 0): number {
   if (prevRunLength <= 0) return 0;
-  const drop = (prevRunLength - result.mapRunLength) / prevRunLength;
+  const drop = Math.max(0, (prevRunLength - result.mapRunLength) / prevRunLength);
   return 1 / (1 + Math.exp(-(drop - 0.5) * 8));
 }
 

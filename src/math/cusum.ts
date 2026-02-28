@@ -61,6 +61,12 @@ export interface CusumUpdateResult {
   state: CusumState;
   /** true when either S⁺ or S⁻ reached the alarm threshold h */
   alarm: boolean;
+  /**
+   * Accumulator values after applying the update formula but BEFORE the alarm
+   * reset.  Useful for scoring: when alarm=true, state.sPos/sNeg are zeroed,
+   * but preResetState reflects the actual peak reached.
+   */
+  preResetState: CusumState;
 }
 
 /**
@@ -76,8 +82,10 @@ export function cusumUpdate(
   const sPos  = Math.max(0, state.sPos + (x - mu0) - k);
   const sNeg  = Math.max(0, state.sNeg - (x - mu0) - k);
   const alarm = sPos >= h || sNeg >= h;
+  const preResetState: CusumState = { sPos, sNeg, n: state.n + 1 };
   return {
     alarm,
+    preResetState,
     state: {
       sPos: alarm ? 0 : sPos,
       sNeg: alarm ? 0 : sNeg,

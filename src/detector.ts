@@ -133,8 +133,11 @@ export class VolumeAnomalyDetector {
     // empiricalRate provides a model-agnostic fallback: even when MLE assigns
     // alpha ≈ 0 (Poisson baseline), a 1000× arrival surge is clearly anomalous
     // and the rate ratio fires where the intensity ratio would not.
-    const timestamps    = sorted.map((t) => t.timestamp / 1000);
-    const windowSec     = (timestamps[timestamps.length - 1]! - timestamps[0]!) || 1;
+    const timestamps = sorted.map((t) => t.timestamp / 1000);
+    // Minimum window = number of events × 1 ms (0.001 s) so that N trades with
+    // identical timestamps don't inflate empiricalRate to N/0 → N/1.
+    const minWindowSec  = timestamps.length * 0.001;
+    const windowSec     = Math.max(timestamps[timestamps.length - 1]! - timestamps[0]!, minWindowSec);
     const empiricalRate = timestamps.length / windowSec;
     const lambda        = hawkesPeakLambda(timestamps, hawkesParams);
     const hawkesScore   = hawkesAnomalyScore(lambda, hawkesParams, empiricalRate);
@@ -152,13 +155,9 @@ export class VolumeAnomalyDetector {
     let peakCusumScore         = 0;
     for (const v of absImbSeries) {
       const upd = cusumUpdate(cusumState, v, cusumParams);
-      // Score before applying reset so alarm events are not lost
-      const scoreNow = cusumAnomalyScore(
-        upd.alarm ? { sPos: Math.max(cusumState.sPos + (v - cusumParams.mu0) - cusumParams.k, 0),
-                      sNeg: Math.max(cusumState.sNeg - (v - cusumParams.mu0) - cusumParams.k, 0),
-                      n: cusumState.n } : upd.state,
-        cusumParams,
-      );
+      // Score against preResetState so alarm events are not lost:
+      // when alarm=true, upd.state is zeroed but preResetState holds the peak.
+      const scoreNow = cusumAnomalyScore(upd.preResetState, cusumParams);
       if (scoreNow > peakCusumScore) peakCusumScore = scoreNow;
       cusumState = upd.state;
     }
