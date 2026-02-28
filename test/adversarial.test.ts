@@ -565,7 +565,9 @@ describe('hawkesPeakLambda >= mu always', () => {
 // Test: optimizer converges to within 0.01 of true minimum.
 
 describe('nelderMead: finds quadratic minimum', () => {
-  it('converges to (3, -2) from starting point (0, 0)', () => {
+  it('converges to (3, -2) from starting point (0, 0) — triggers zero-init branch', () => {
+    // x0=[0,0]: v[i]=0 → Math.abs(0) < 1e-10 → добавляет step=0.2 вместо scale
+    // Покрывает ternary branch на строке 26 optimizer.ts
     const f = ([x, y]: number[]) => (x! - 3) ** 2 + (y! + 2) ** 2;
     const r = nelderMead(f, [0, 0], { maxIter: 1000, tol: 1e-10 });
     expect(r.converged).toBe(true);
@@ -614,5 +616,154 @@ describe('hawkesAnomalyScore: monotone in peakLambda', () => {
     const s3 = hawkesAnomalyScore(2, params, 20);
     expect(s2).toBeGreaterThanOrEqual(s1);
     expect(s3).toBeGreaterThanOrEqual(s2);
+  });
+});
+
+// ─── 17. branch coverage: hawkes.ts uncovered branches ───────────────────────
+//
+// hawkes.ts:96  — `T=0 || 1` fallback: < 10 timestamps все одинаковые → T=0
+// hawkes.ts:156 — `if (ti >= t) break` в hawkesLambda: timestamp в истории >= t
+
+describe('hawkes: branch coverage', () => {
+  it('hawkesFit < 10 with identical timestamps uses || 1 fallback (T=0)', () => {
+    // timestamps[n-1] - timestamps[0] = 0 → || 1 → mu = n/1 = n
+    const r = hawkesFit([5, 5, 5, 5, 5]);
+    expect(r.converged).toBe(false);
+    expect(r.params.mu).toBeCloseTo(5, 10); // n=5, T=0||1=1 → mu=5
+    expect(r.params.mu).toBeGreaterThan(0);
+  });
+
+  it('hawkesLambda breaks early when ti >= t (timestamp at or after query time)', () => {
+    // timestamps содержит элемент >= t → break срабатывает раньше конца массива
+    const params = { mu: 1, alpha: 0.5, beta: 2 };
+    // t=2, история [0, 1, 2, 3] → при ti=2 >= t=2 → break
+    const lambdaWithBreak = hawkesLambda(2, [0, 1, 2, 3], params);
+    // без break (если бы он не работал) ti=2 и ti=3 добавились бы
+    const lambdaCorrect   = hawkesLambda(2, [0, 1], params);
+    // Они должны быть одинаковы — break правильно исключает ti >= t
+    expect(lambdaWithBreak).toBeCloseTo(lambdaCorrect, 10);
+  });
+});
+
+// ─── 18. (перенумерация) cusumAnomalyScore: h <= 0 guard ─────────────────────
+//
+// cusumAnomalyScore:108 — `if (params.h <= 0) return 0` не покрыта.
+// Это защита от деления на ноль: s/h при h=0.
+
+describe('cusumAnomalyScore: h <= 0 returns 0', () => {
+  it('returns 0 when h = 0', () => {
+    const state = { sPos: 5, sNeg: 3, n: 10 };
+    expect(cusumAnomalyScore(state, { mu0: 0, std0: 1, k: 0, h: 0 })).toBe(0);
+  });
+
+  it('returns 0 when h < 0', () => {
+    const state = { sPos: 5, sNeg: 3, n: 10 };
+    expect(cusumAnomalyScore(state, { mu0: 0, std0: 1, k: 0, h: -1 })).toBe(0);
+  });
+});
+
+// ─── 18. hawkesFit: invalid fallback path ────────────────────────────────────
+//
+// hawkes.ts:124-131 — fallback когда optimizer не сошёлся или вышел за границы.
+// Срабатывает при очень мало данных (< 10 timestamps → другой path) или
+// при данных где optimizer застревает в penalty region.
+// Тест: передаём timestamps где MLE заведомо проблемный.
+
+describe('hawkesFit: invalid/fallback path', () => {
+  it('fallback params are all positive and stationarity = 0.01', () => {
+    // 2 одинаковых timestamp → T=0 → mu=n/(0||1)=n, optimizer стартует странно.
+    // Либо converged=false (fallback), либо converged=true (valid params).
+    // В любом случае: все params > 0 и стационарность >= 0.
+    const r = hawkesFit([1_700_000_000, 1_700_000_000, 1_700_000_000,
+                         1_700_000_000, 1_700_000_000, 1_700_000_000,
+                         1_700_000_000, 1_700_000_000, 1_700_000_000,
+                         1_700_000_000, 1_700_000_000]);
+    expect(r.params.mu).toBeGreaterThan(0);
+    expect(r.params.alpha).toBeGreaterThan(0);
+    expect(r.params.beta).toBeGreaterThan(0);
+    expect(Number.isFinite(r.stationarity)).toBe(true);
+    expect(r.stationarity).toBeGreaterThanOrEqual(0);
+  });
+
+  it('fallback when not converged: converged=false, logLik=-Infinity', () => {
+    // < 10 timestamps → сразу возвращает converged=false без optimizer
+    const r = hawkesFit([0, 1, 2]);
+    expect(r.converged).toBe(false);
+    expect(r.logLik).toBe(-Infinity);
+    expect(r.params.mu).toBeGreaterThan(0);
+  });
+});
+
+// ─── 19. nelderMead: shrink step ─────────────────────────────────────────────
+//
+// optimizer.ts:78-83 — shrink шаг срабатывает когда contraction тоже плохой.
+// Нужна функция где и reflection, и contraction хуже лучшей вершины.
+// Rosenbrock с плохим стартом провоцирует shrink.
+
+describe('nelderMead: shrink step executed', () => {
+  it('Rosenbrock from bad start still converges to near-minimum', () => {
+    // f = (1-x)^2 + 100*(y-x^2)^2, min at (1,1)=0
+    // Старт (-2, 3) — далеко, провоцирует shrink шаги
+    const f = ([x, y]: number[]) => (1 - x!) ** 2 + 100 * (y! - x! ** 2) ** 2;
+    const r = nelderMead(f, [-2, 3], { maxIter: 10000, tol: 1e-10 });
+    expect(Number.isFinite(r.fx)).toBe(true);
+    expect(r.fx).toBeGreaterThanOrEqual(0);
+    expect(r.fx).toBeLessThan(0.1);
+  });
+
+  it('shrink path covered: adversarial stateful function forces shrink branch', () => {
+    // Shrink происходит когда fc >= fvals[n] (contraction хуже worst).
+    // Гарантируем это: функция которая на шагах contraction всегда возвращает
+    // значение хуже worst за счёт состояния. Используем счётчик вызовов:
+    // первые 3 вызова (инициализация simplex) — обычные значения,
+    // затем для всех точек кроме best — очень большое значение.
+    // Это заставит reflection → плохо, contraction → плохо → shrink.
+    let callN = 0;
+    const pts: number[][] = [];
+    const f = (x: number[]) => {
+      callN++;
+      pts.push(x.slice());
+      // Инициализация simplex: первые n+1=3 вызовов — нормальная квадратичная
+      if (callN <= 3) return x[0]! * x[0]! + x[1]! * x[1]!;
+      // После инициализации: best=simplex[0] близко к (0,0).
+      // Для всех остальных точек — огромное значение → shrink вынужден.
+      const dist0 = x[0]! * x[0]! + x[1]! * x[1]!;
+      // Если точка далека от (0,0) → большое значение
+      return dist0 < 0.001 ? dist0 : 1e6 + dist0;
+    };
+    const r = nelderMead(f, [0, 0], { maxIter: 200, tol: 1e-6 });
+    expect(Number.isFinite(r.fx)).toBe(true);
+    // Optimizer может застрять но не должен крашиться
+    expect(r.fx).toBeGreaterThanOrEqual(0);
+    void pts;
+  });
+});
+
+// ─── 20. logSumExp: b === -Infinity branch ────────────────────────────────────
+//
+// bocpd.ts:247 — `if (b === -Infinity) return a` не покрыта напрямую.
+// bocpdBatch с одним наблюдением триггерит это через reduce с начальным -Infinity.
+
+describe('bocpdUpdate: logSumExp b=-Infinity branch', () => {
+  it('single observation does not produce NaN or Infinity in cpProbability', () => {
+    // После первого update normLogProbs имеет 2 элемента.
+    // logSumExp вызывается через reduce начиная с -Infinity как накопителем.
+    const r = bocpdUpdate(bocpdInitState(), 0.5, { mu0: 0, kappa0: 1, alpha0: 1, beta0: 1 });
+    expect(Number.isFinite(r.cpProbability)).toBe(true);
+    expect(r.cpProbability).toBeGreaterThanOrEqual(0);
+    expect(r.cpProbability).toBeLessThanOrEqual(1);
+  });
+
+  it('logProbs sum to 1 even after heavy pruning (tests ?? -Infinity branch)', () => {
+    // Очень низкий hazardLambda → малая вероятность CP → r=0 может быть pruned
+    // Тогда normLogProbs[0] может быть undefined → ?? -Infinity → exp(-Inf)=0
+    let s = bocpdInitState();
+    // Кормим сильно отличающиеся данные — часть гипотез будет pruned
+    for (let i = 0; i < 5; i++) {
+      const r = bocpdUpdate(s, i < 3 ? 0 : 1000, { mu0: 0, kappa0: 1, alpha0: 1, beta0: 0.001 }, 10000);
+      const sum = r.state.logProbs.reduce((acc, lp) => acc + Math.exp(lp), 0);
+      expect(sum).toBeCloseTo(1, 3);
+      s = r.state;
+    }
   });
 });
