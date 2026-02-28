@@ -20,7 +20,11 @@ import {
   hawkesPeakLambda,
   hawkesLogLikelihood,
   hawkesLambda,
+  hawkesFit,
+  volumeImbalance,
 } from '../src/math/hawkes.js';
+import { cusumFit } from '../src/math/cusum.js';
+import { nelderMead } from '../src/math/optimizer.js';
 import { VolumeAnomalyDetector }     from '../src/detector.js';
 import type { IAggregatedTradeData } from '../src/types.js';
 
@@ -341,5 +345,274 @@ describe('detector: confidence threshold behaviour', () => {
     // combined can be 1.0 only if ALL detectors score 1 simultaneously — very unlikely on calm data
     // At minimum: anomaly = (combined === 1)
     expect(result.anomaly).toBe(result.confidence >= 1);
+  });
+});
+
+// ─── 9. hawkesFit: stationarity constraint always respected ──────────────────
+//
+// negLL penalty returns 1e10 when alpha >= beta.
+// Тест: hawkesFit never returns converged params where alpha >= beta.
+// Без теста фикс optimizer penalty мог бы тихо сломаться.
+
+describe('hawkesFit: stationarity constraint alpha < beta', () => {
+  function check(ts: number[]) {
+    const r = hawkesFit(ts);
+    if (r.converged) {
+      // When converged, the optimizer found a valid interior point
+      expect(r.params.alpha).toBeLessThan(r.params.beta);
+      expect(r.params.mu).toBeGreaterThan(0);
+      expect(r.params.alpha).toBeGreaterThan(0);
+      expect(r.params.beta).toBeGreaterThan(0);
+    }
+    // stationarity = alpha/beta reported correctly
+    expect(r.stationarity).toBeCloseTo(r.params.alpha / r.params.beta, 8);
+  }
+
+  it('uniform arrivals do not produce supercritical params', () => {
+    const ts = Array.from({ length: 100 }, (_, i) => i * 0.2);
+    check(ts);
+  });
+
+  it('clustered arrivals do not produce supercritical params', () => {
+    const ts: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      for (let j = 0; j < 5; j++) ts.push(i * 10 + j * 0.05);
+    }
+    check(ts);
+  });
+
+  it('stationarity = alpha / beta exactly', () => {
+    const ts = Array.from({ length: 50 }, (_, i) => i * 0.1);
+    const r  = hawkesFit(ts);
+    expect(r.stationarity).toBeCloseTo(r.params.alpha / r.params.beta, 10);
+  });
+});
+
+// ─── 10. rollingAbsImbalance output length ────────────────────────────────────
+//
+// rollingAbsImbalance(sorted) для n трейдов и windowSize w возвращает
+// n - w + 1 элементов: цикл `for (i = w; i <= n; i++)` включает оба конца.
+// То есть n === w даёт 1 окно (весь массив), n === w-1 даёт 0 окон.
+
+describe('detector: rollingAbsImbalance output length', () => {
+  it('n < windowSize → 0 windows → CUSUM/BOCPD не делают шагов', () => {
+    // w=20, trades=19 → i starts at 20, 20 <= 19 false → пустой массив
+    const det = new VolumeAnomalyDetector({ windowSize: 20 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 300; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+
+    const recent: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 19; i++) recent.push(trade(400_000 + i * 1000, 1, i % 2 === 0));
+    const r = det.detect(recent);
+    // 0 rolling windows → BOCPD не шагал → runLength = 0
+    expect(r.runLength).toBe(0);
+    expect(r.cusumStat).toBe(0);
+  });
+
+  it('n === windowSize → 1 окно (весь массив)', () => {
+    // w=10, trades=10 → i=10 <= 10 → одна итерация → slice(0,10)
+    const det = new VolumeAnomalyDetector({ windowSize: 10 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+
+    // 10 чередующихся buy/sell → |imbalance| ≈ 0 → CUSUM/BOCPD видят один шаг
+    const recent: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 10; i++) recent.push(trade(300_000 + i * 1000, 1, i % 2 === 0));
+    const r = det.detect(recent);
+    // BOCPD делает 1 шаг → runLength = 1 (первый шаг всегда MAP RL = 0 или 1)
+    // Главное: результат конечный и в диапазоне
+    expect(Number.isFinite(r.confidence)).toBe(true);
+    expect(r.confidence).toBeGreaterThanOrEqual(0);
+    expect(r.confidence).toBeLessThanOrEqual(1);
+  });
+
+  it('n > windowSize → n - w + 1 окон, confidence финитна', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 10 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+
+    // 50 трейдов → 41 окно → BOCPD видит 41 шаг, runLength растёт
+    const recent: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 50; i++) recent.push(trade(300_000 + i * 1000, 1, i % 2 === 0));
+    const r = det.detect(recent);
+    expect(Number.isFinite(r.confidence)).toBe(true);
+    expect(r.runLength).toBeGreaterThan(0); // минимум 1 шаг BOCPD был сделан
+  });
+});
+
+// ─── 11. train() boundary: 49 throws, 50 succeeds ────────────────────────────
+//
+// train() documents "Need at least 50 trades".
+// Test the exact boundary — не 51, а точно 50.
+
+describe('VolumeAnomalyDetector.train() boundary', () => {
+  it('throws with 49 trades', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 10 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 49; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    expect(() => det.train(hist)).toThrow('50');
+  });
+
+  it('succeeds with exactly 50 trades', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 10 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 50; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    expect(() => det.train(hist)).not.toThrow();
+    expect(det.isTrained).toBe(true);
+  });
+
+  it('scoreWeights not summing to 1 throws at construction', () => {
+    expect(() => new VolumeAnomalyDetector({ scoreWeights: [0.5, 0.3, 0.3] }))
+      .toThrow('scoreWeights');
+  });
+
+  it('scoreWeights summing to 1 exactly does not throw', () => {
+    expect(() => new VolumeAnomalyDetector({ scoreWeights: [0.4, 0.3, 0.3] }))
+      .not.toThrow();
+  });
+});
+
+// ─── 12. cusumFit with a single value ────────────────────────────────────────
+//
+// n=1 → var = (x - mean)^2 / max(n-1, 1) = 0 / 1 = 0 → std0 = 0.
+// Code: std0 = Math.sqrt(var0) || 1e-6 → falls back to 1e-6 (truthy check fails for 0).
+// Test: no NaN/Infinity, std0 > 0, k and h are positive.
+
+describe('cusumFit: single-value array', () => {
+  it('std0 falls back to 1e-6, not 0 or NaN', () => {
+    const p = cusumFit([0.5]);
+    expect(Number.isFinite(p.std0)).toBe(true);
+    expect(p.std0).toBeGreaterThan(0);
+    expect(p.mu0).toBeCloseTo(0.5, 10);
+    expect(p.k).toBeGreaterThan(0);
+    expect(p.h).toBeGreaterThan(0);
+  });
+
+  it('constant array (zero variance) gives std0 = 1e-6', () => {
+    const p = cusumFit([3, 3, 3, 3, 3]);
+    expect(p.std0).toBeCloseTo(1e-6, 10);
+    expect(Number.isFinite(p.k)).toBe(true);
+    expect(Number.isFinite(p.h)).toBe(true);
+  });
+});
+
+// ─── 13. volumeImbalance always in [-1, +1] ──────────────────────────────────
+//
+// (buyVol - sellVol) / total → by construction ∈ [-1, +1], but floating-point
+// extremes (very large or very small qty) should not escape the range.
+
+describe('volumeImbalance: always in [-1, +1]', () => {
+  const cases: Array<[number, boolean][]> = [
+    [[1e308, false]],                                      // all buy, extreme qty
+    [[1e308, true]],                                       // all sell, extreme qty
+    [[1e-308, false], [1e-308, true]],                     // balanced tiny qty
+    [[1e308, false], [1e-300, true]],                      // heavily buy-skewed
+    [[Number.MAX_SAFE_INTEGER, false], [1, true]],         // large vs small
+  ];
+
+  for (const trades of cases) {
+    it(`imbalance ∈ [-1,+1] for qty pattern [${trades.map(([q, m]) => `${q.toExponential(0)}/${m}`).join(',')}]`, () => {
+      const t = trades.map(([qty, isBuyerMaker]) =>
+        ({ id: '0', price: 100, qty, timestamp: 0, isBuyerMaker } as IAggregatedTradeData),
+      );
+      const imb = volumeImbalance(t);
+      expect(imb).toBeGreaterThanOrEqual(-1);
+      expect(imb).toBeLessThanOrEqual(1);
+      expect(Number.isFinite(imb)).toBe(true);
+    });
+  }
+});
+
+// ─── 14. hawkesPeakLambda >= mu always ────────────────────────────────────────
+//
+// hawkesPeakLambda initialises peak = mu and only updates upward.
+// Test: peak >= mu for any non-empty timestamps + positive params.
+
+describe('hawkesPeakLambda >= mu always', () => {
+  it('returns exactly mu for empty timestamps', () => {
+    const params = { mu: 3, alpha: 0.5, beta: 2 };
+    expect(hawkesPeakLambda([], params)).toBe(3);
+  });
+
+  it('peak >= mu for single timestamp', () => {
+    const params = { mu: 1, alpha: 0.5, beta: 2 };
+    // First event: A=0, lam = mu + alpha*0 = mu → peak = mu
+    expect(hawkesPeakLambda([0], params)).toBeGreaterThanOrEqual(params.mu);
+  });
+
+  it('peak >= mu for clustered timestamps (excitation adds to mu)', () => {
+    const params = { mu: 1, alpha: 0.5, beta: 2 };
+    const ts = [0, 0.01, 0.02, 0.03, 0.04]; // tight cluster
+    const peak = hawkesPeakLambda(ts, params);
+    expect(peak).toBeGreaterThanOrEqual(params.mu);
+    // In a tight cluster, A grows → peak >> mu
+    expect(peak).toBeGreaterThan(params.mu);
+  });
+
+  it('peak >= mu even when alpha is very small', () => {
+    const params = { mu: 5, alpha: 1e-10, beta: 1 };
+    const ts = [0, 1, 2, 3, 4];
+    expect(hawkesPeakLambda(ts, params)).toBeGreaterThanOrEqual(params.mu);
+  });
+});
+
+// ─── 15. nelderMead: finds known quadratic minimum ───────────────────────────
+//
+// f(x,y) = (x - 3)^2 + (y + 2)^2  → min at (3, -2), f=0.
+// Test: optimizer converges to within 0.01 of true minimum.
+
+describe('nelderMead: finds quadratic minimum', () => {
+  it('converges to (3, -2) from starting point (0, 0)', () => {
+    const f = ([x, y]: number[]) => (x! - 3) ** 2 + (y! + 2) ** 2;
+    const r = nelderMead(f, [0, 0], { maxIter: 1000, tol: 1e-10 });
+    expect(r.converged).toBe(true);
+    expect(r.x[0]).toBeCloseTo(3,  2);
+    expect(r.x[1]).toBeCloseTo(-2, 2);
+    expect(r.fx).toBeCloseTo(0, 4);
+  });
+
+  it('converges to (0, 0, 0) for 3D bowl from (1, 1, 1)', () => {
+    const f = ([x, y, z]: number[]) => x! ** 2 + y! ** 2 + z! ** 2;
+    const r = nelderMead(f, [1, 1, 1], { maxIter: 2000, tol: 1e-10 });
+    expect(r.converged).toBe(true);
+    expect(r.fx).toBeCloseTo(0, 4);
+  });
+
+  it('fx is always finite after run (no NaN or Infinity)', () => {
+    // Rosenbrock (harder): f = (1-x)^2 + 100*(y-x^2)^2
+    const f = ([x, y]: number[]) => (1 - x!) ** 2 + 100 * (y! - x! ** 2) ** 2;
+    const r = nelderMead(f, [0, 0], { maxIter: 5000, tol: 1e-8 });
+    expect(Number.isFinite(r.fx)).toBe(true);
+    expect(r.fx).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ─── 16. hawkesAnomalyScore: monotone in peakLambda ─────────────────────────
+//
+// The sigmoid sig(x/meanLambda) is strictly monotone.
+// Higher peakLambda → higher intensityScore → higher or equal final score.
+
+describe('hawkesAnomalyScore: monotone in peakLambda', () => {
+  it('score is non-decreasing as lambda increases', () => {
+    const params = { mu: 1, alpha: 0.3, beta: 2 };
+    const lambdas = [0.5, 1, 2, 3, 5, 10, 20, 50];
+    let prev = -Infinity;
+    for (const lam of lambdas) {
+      const s = hawkesAnomalyScore(lam, params);
+      expect(s).toBeGreaterThanOrEqual(prev - 1e-12); // monotone (with float tolerance)
+      prev = s;
+    }
+  });
+
+  it('score with higher empiricalRate >= score with lower (all else equal)', () => {
+    const params = { mu: 1, alpha: 0.3, beta: 2 };
+    const s1 = hawkesAnomalyScore(2, params, 1);
+    const s2 = hawkesAnomalyScore(2, params, 5);
+    const s3 = hawkesAnomalyScore(2, params, 20);
+    expect(s2).toBeGreaterThanOrEqual(s1);
+    expect(s3).toBeGreaterThanOrEqual(s2);
   });
 });
