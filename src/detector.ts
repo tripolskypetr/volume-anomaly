@@ -136,13 +136,26 @@ export class VolumeAnomalyDetector {
     const imbalance = volumeImbalance(sorted);
     const absImb    = Math.abs(imbalance);
 
-    // ── 3. CUSUM on |imbalance| rolling series
+    // ── 3. CUSUM on |imbalance| rolling series.
+    // Track the peak S/h ratio seen during the run, including just before any
+    // alarm reset.  This captures evidence even when the alarm fires mid-window
+    // and the accumulator resets to zero before the last observation.
     let cusumState: CusumState = cusumInitState();
     const absImbSeries         = this.rollingAbsImbalance(sorted);
+    let peakCusumScore         = 0;
     for (const v of absImbSeries) {
-      cusumState = cusumUpdate(cusumState, v, cusumParams).state;
+      const upd = cusumUpdate(cusumState, v, cusumParams);
+      // Score before applying reset so alarm events are not lost
+      const scoreNow = cusumAnomalyScore(
+        upd.alarm ? { sPos: Math.max(cusumState.sPos + (v - cusumParams.mu0) - cusumParams.k, 0),
+                      sNeg: Math.max(cusumState.sNeg - (v - cusumParams.mu0) - cusumParams.k, 0),
+                      n: cusumState.n } : upd.state,
+        cusumParams,
+      );
+      if (scoreNow > peakCusumScore) peakCusumScore = scoreNow;
+      cusumState = upd.state;
     }
-    const cusumScore = cusumAnomalyScore(cusumState, cusumParams);
+    const cusumScore = peakCusumScore;
 
     // ── 4. BOCPD on |imbalance| rolling series — same space as training prior
     let bocpdResult = { mapRunLength: 0, cpProbability: 0, state: bocpdInitState() };

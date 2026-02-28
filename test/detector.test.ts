@@ -234,6 +234,123 @@ describe('false positive rate', () => {
   });
 });
 
+// ─── Per-detector isolation ───────────────────────────────────────────────────
+//
+// Each test isolates one detector by setting its scoreWeight to 1.0 and the
+// others to 0.0, then crafts a window that specifically triggers that detector
+// while keeping the others quiet.  The tests verify:
+//   (a) the expected signal kind is present in result.signals
+//   (b) no unexpected signal kinds are present
+//   (c) result.anomaly is consistent with the isolated score
+//
+// Training baseline for all tests: 300 trades, balanced buy/sell,
+// steady 1 s intervals — a calm, in-control market.
+
+describe('per-detector isolation', () => {
+  // ── Shared deterministic baseline ─────────────────────────────────────────
+
+  function makeBaseline(n = 300): IAggregatedTradeData[] {
+    const trades: IAggregatedTradeData[] = [];
+    for (let i = 0; i < n; i++) {
+      // Alternating buy/sell of equal qty → |imbalance| ≈ 0 in every window.
+      // Steady 1 s spacing → μ ≈ 1 trade/s, low branching ratio after MLE.
+      trades.push(makeTrade(i * 1000, 1, i % 2 === 0));
+    }
+    return trades;
+  }
+
+  // ── Hawkes (volume_spike) ──────────────────────────────────────────────────
+  //
+  // Trigger: cram many trades into a tiny time window so λ(t_last) >> μ.
+  // Baseline: 1 trade/s → μ ≈ 1.  Recent: 200 trades in 1 s → λ >> 2·μ.
+  // Keep imbalance ≈ 0 (alternating) so CUSUM / BOCPD stay quiet.
+
+  it('Hawkes fires on arrival-rate spike with balanced imbalance', () => {
+    const detector = new VolumeAnomalyDetector({
+      windowSize:   20,
+      scoreWeights: [1.0, 0.0, 0.0],   // only Hawkes contributes
+    });
+    detector.train(makeBaseline());
+
+    const recent: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      // 200 trades in 200 ms total (1 ms apart) — 1000× the baseline rate.
+      // Alternating buy/sell → balanced, so CUSUM/BOCPD see ≈ 0 imbalance.
+      recent.push(makeTrade(300_000 + i, 1, i % 2 === 0));
+    }
+
+    const result = detector.detect(recent, 0.0);
+
+    expect(result.signals.some((s) => s.kind === 'volume_spike')).toBe(true);
+    expect(result.signals.every((s) => s.kind !== 'cusum_alarm')).toBe(true);
+    expect(result.signals.every((s) => s.kind !== 'bocpd_changepoint')).toBe(true);
+    // With weight=1 the anomaly flag is purely driven by hawkesScore
+    expect(result.anomaly).toBe(result.confidence >= 0.75);
+  });
+
+  // ── CUSUM (cusum_alarm) ────────────────────────────────────────────────────
+  //
+  // Trigger: sustained one-sided imbalance well above the trained baseline.
+  // Baseline: |imbalance| ≈ 0.  Recent: all-buy for many windows → |imb| ≈ 1
+  // in every rolling window → CUSUM accumulates until alarm.
+  // Arrival rate identical to baseline → Hawkes stays quiet.
+
+  it('CUSUM fires on sustained imbalance shift at baseline arrival rate', () => {
+    const detector = new VolumeAnomalyDetector({
+      windowSize:   20,
+      cusumHSigmas: 2,                  // lower h so CUSUM fires faster in test
+      scoreWeights: [0.0, 1.0, 0.0],   // only CUSUM contributes
+    });
+    detector.train(makeBaseline());
+
+    const recent: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      // Arrival rate = 1 trade/s (same as baseline) → Hawkes quiet.
+      // All buy aggressors (isBuyerMaker=false) → |imbalance| = 1 in every window.
+      recent.push(makeTrade(300_000 + i * 1000, 1, false));
+    }
+
+    const result = detector.detect(recent, 0.0);
+
+    expect(result.signals.some((s) => s.kind === 'cusum_alarm')).toBe(true);
+    expect(result.signals.every((s) => s.kind !== 'volume_spike')).toBe(true);
+    expect(result.signals.every((s) => s.kind !== 'bocpd_changepoint')).toBe(true);
+  });
+
+  // ── BOCPD (bocpd_changepoint) ─────────────────────────────────────────────
+  //
+  // Trigger: abrupt one-step distribution shift.  Feed many observations near 0
+  // (matching the prior), then a single observation at 1.0.  The sudden
+  // surprise concentrates posterior mass on r=0 (changepoint).
+  // Arrival rate and overall imbalance stay near baseline → Hawkes / CUSUM quiet.
+
+  it('BOCPD fires on abrupt distribution shift at baseline arrival rate', () => {
+    const detector = new VolumeAnomalyDetector({
+      windowSize:   10,
+      hazardLambda: 5,                  // low λ → model expects frequent changes → more sensitive
+      scoreWeights: [0.0, 0.0, 1.0],   // only BOCPD contributes
+    });
+
+    // Baseline: alternating balanced trades → |imbalance| ≈ 0 per window
+    detector.train(makeBaseline());
+
+    const recent: IAggregatedTradeData[] = [];
+    // First 100 trades: balanced, 1 s apart — matches training distribution
+    for (let i = 0; i < 100; i++) {
+      recent.push(makeTrade(300_000 + i * 1000, 1, i % 2 === 0));
+    }
+    // Abrupt shift: next 20 trades are all-buy, same arrival rate
+    for (let i = 0; i < 20; i++) {
+      recent.push(makeTrade(400_000 + i * 1000, 1, false));
+    }
+
+    const result = detector.detect(recent, 0.0);
+
+    expect(result.signals.some((s) => s.kind === 'bocpd_changepoint')).toBe(true);
+    expect(result.signals.every((s) => s.kind !== 'volume_spike')).toBe(true);
+  });
+});
+
 // ─── Functional API ───────────────────────────────────────────────────────────
 
 describe('detect() functional API', () => {
