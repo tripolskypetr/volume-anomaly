@@ -185,29 +185,39 @@ export function bocpdUpdate(
 // ─── Score ────────────────────────────────────────────────────────────────────
 
 /**
- * Anomaly score [0,1]: how likely a changepoint occurred recently.
+ * Anomaly score [0,1]: how much evidence there is for a recent changepoint.
  *
- * cpProbability alone is insufficient: its steady-state value equals the prior
- * hazard H = 1/λ regardless of how surprising the data is.
+ * The MAP run length is the primary signal.  In a stable process with no
+ * changepoints, mapRunLength grows monotonically with each new observation
+ * and after t steps mapRunLength ≈ t.  A changepoint resets it.  The ratio
  *
- * Instead we use the MAP run length relative to the expected gap between
- * changepoints (hazardLambda).  In a stable process the MAP run length grows
- * toward hazardLambda; a fresh changepoint resets it to 0.  The score is
- * therefore highest just after a reset and decays as the new run grows:
+ *   gap = (t − mapRunLength) / t
  *
- *   score = exp(−mapRunLength / halfLife)
+ * is therefore 0 in a stable process and close to 1 immediately after a
+ * changepoint (mapRunLength ≪ t).  We pass this through a sigmoid centred
+ * at gap = 0.5 so that the score becomes meaningful only after the run
+ * length has fallen to less than half the total elapsed steps.
  *
- * where halfLife = hazardLambda / 4 so that at one quarter of the expected
- * changepoint gap the score has already decayed to ~0.37.  This ensures that
- * at steady state (mapRunLength ≈ hazardLambda) the score is near zero, while
- * a fresh reset (mapRunLength ≈ 0..5) gives a score close to 1.
+ * Additionally cpProbability provides a complementary signal when it spikes
+ * above the prior hazard H = 1/hazardLambda.
  *
- * @param result        Output from bocpdUpdate.
- * @param hazardLambda  Expected gap between changepoints (same as passed to bocpdUpdate).
+ * @param result  Output from bocpdUpdate (must include state.t via BocpdState).
+ * @param hazardLambda  Expected gap between changepoints.
  */
 export function bocpdAnomalyScore(result: BocpdUpdateResult, hazardLambda = 200): number {
-  const halfLife = Math.max(hazardLambda / 4, 1);
-  return Math.exp(-result.mapRunLength / halfLife);
+  const t = result.state.t;
+  if (t < 2) return 0;
+
+  // Gap score: fraction of elapsed steps NOT in the current run.
+  const gap = (t - result.mapRunLength) / t;
+  const gapScore = 1 / (1 + Math.exp(-(gap - 0.5) * 8)); // sigmoid, steep at gap=0.5
+
+  // cpProb score: normalised by prior hazard
+  const H        = 1 / hazardLambda;
+  const ratio    = result.cpProbability / H;
+  const cpScore  = 1 / (1 + Math.exp(-(ratio - 3)));
+
+  return Math.max(gapScore, cpScore);
 }
 
 // ─── Batch ────────────────────────────────────────────────────────────────────

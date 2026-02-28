@@ -165,19 +165,20 @@ export class VolumeAnomalyDetector {
     const cusumScore = peakCusumScore;
 
     // ── 4. BOCPD on |imbalance| rolling series — same space as training prior.
-    // bocpdAnomalyScore uses exp(−mapRunLength/10): score is highest right
-    // after a changepoint (mapRunLength ≈ 0..1) and decays as the new run
-    // grows.  We track the minimum mapRunLength seen after the first step to
-    // capture changepoints that occurred earlier in the window.
+    // Track the peak cpProbability seen during the run.  bocpdAnomalyScore
+    // normalises by the prior hazard H = 1/hazardLambda, so only cpProbability
+    // meaningfully above the prior (i.e. real evidence for a changepoint) lifts
+    // the score.  Taking the peak over the window captures changepoints that
+    // occurred earlier and whose cpProbability has since decayed.
     let bocpdResult = { mapRunLength: 0, cpProbability: 0, state: bocpdInitState() };
     let bestBocpdResult = bocpdResult;
     for (const v of absImbSeries) {
       bocpdResult = bocpdUpdate(bocpdResult.state, v, bocpdPrior, this.cfg.hazardLambda);
-      if (bocpdAnomalyScore(bocpdResult) > bocpdAnomalyScore(bestBocpdResult)) {
+      if (bocpdResult.cpProbability > bestBocpdResult.cpProbability) {
         bestBocpdResult = bocpdResult;
       }
     }
-    const bocpdScore = bocpdAnomalyScore(bestBocpdResult);
+    const bocpdScore = bocpdAnomalyScore(bestBocpdResult, this.cfg.hazardLambda);
 
     // ── 5. Combine scores
     const combined = wH! * hawkesScore + wC! * cusumScore + wB! * bocpdScore;
