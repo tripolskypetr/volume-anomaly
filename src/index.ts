@@ -60,23 +60,30 @@ export function detect(
  * - `'short'`   — anomaly detected + sell-side order flow dominates
  * - `'neutral'` — no anomaly, or anomaly is a pure rate spike with balanced flow
  *
+ * The directional threshold is derived automatically from training data:
+ * `imbalanceThreshold = p75 of the rolling signed imbalance series` (configurable
+ * via `DetectorConfig.imbalancePercentile`). Pass an explicit number to override.
+ *
  * @param historical          Baseline window (≥ 50 trades) for model training.
  * @param recent              Recent window to evaluate.
  * @param confidence          Anomaly threshold [0,1]. Default 0.75.
- * @param imbalanceThreshold  Minimum |imbalance| to assign long/short. Default 0.3.
+ * @param imbalanceThreshold  Override the trained threshold. Omit to use p75 from training.
  */
 export function predict(
   historical:          IAggregatedTradeData[],
   recent:              IAggregatedTradeData[],
   confidence:          number = 0.75,
-  imbalanceThreshold:  number = 0.3,
+  imbalanceThreshold?: number,
 ): PredictionResult {
-  const r = detect(historical, recent, confidence);
+  const detector = new VolumeAnomalyDetector();
+  detector.train(historical);
+  const r   = detector.detect(recent, confidence);
+  const thr = imbalanceThreshold ?? detector.trainedModels!.imbalanceThreshold;
 
   let direction: Direction = 'neutral';
   if (r.anomaly) {
-    if (r.imbalance >  imbalanceThreshold) direction = 'long';
-    else if (r.imbalance < -imbalanceThreshold) direction = 'short';
+    if (r.imbalance >  thr) direction = 'long';
+    else if (r.imbalance < -thr) direction = 'short';
   }
 
   return {

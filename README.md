@@ -98,15 +98,20 @@ const result = predict(historical, recent, 0.75, 0.3);
 | `historical` | `IAggregatedTradeData[]` | required | Baseline window for training (≥ 50 trades) |
 | `recent` | `IAggregatedTradeData[]` | required | Window to evaluate |
 | `confidence` | `number` | `0.75` | Anomaly threshold [0,1] |
-| `imbalanceThreshold` | `number` | `0.3` | Minimum `\|imbalance\|` required to emit `long` or `short`. Below this the direction is `neutral` even when `anomaly = true` |
+| `imbalanceThreshold` | `number` | *(trained)* | Override the trained directional threshold. Omit to use the value derived automatically from training data (p75 of the rolling signed imbalance series) |
 
 **Direction logic:**
 
 ```
-direction = 'long'    if anomaly && imbalance >  +imbalanceThreshold
-direction = 'short'   if anomaly && imbalance < −imbalanceThreshold
+thr = imbalanceThreshold  (if provided explicitly)
+    = detector.trainedModels.imbalanceThreshold  (otherwise — p75 from training)
+
+direction = 'long'    if anomaly && imbalance >  +thr
+direction = 'short'   if anomaly && imbalance < −thr
 direction = 'neutral' otherwise (no anomaly, or balanced flow)
 ```
+
+On a neutral/balanced market `thr` will be near 0 (most windows have close-to-zero imbalance, p75 ≈ 0.1–0.2). On a trending market the p75 shifts upward with the trend, so the bar for `direction=long` rises accordingly — preventing chronic false long signals during a bull run where sustained buy imbalance is normal, not anomalous.
 
 **Returns:** `PredictionResult`
 
@@ -152,6 +157,7 @@ const { hawkesParams, cusumParams, bocpdPrior } = detector.trainedModels!;
 | `cusumKSigmas` | `number` | `0.5` | CUSUM allowable slack k in σ units. Controls sensitivity: lower k = faster response but more false positives |
 | `cusumHSigmas` | `number` | `5` | CUSUM alarm threshold h in σ units. Higher h = fewer but more confident alarms (ARL₀ ≈ 148 at h = 5σ) |
 | `scoreWeights` | `[n, n, n]` | `[0.4, 0.3, 0.3]` | Weights for [Hawkes, CUSUM, BOCPD] scores. Must sum to 1 |
+| `imbalancePercentile` | `number` | `75` | Percentile of the training rolling signed imbalance used as the directional threshold. p75 = direction fires only when imbalance exceeds the 75th percentile of the training distribution |
 
 ---
 

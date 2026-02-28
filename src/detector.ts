@@ -38,22 +38,45 @@ export interface DetectorConfig {
    * Must be 3 values [hawkes, cusum, bocpd] summing to 1.
    */
   scoreWeights?: [number, number, number];
+  /**
+   * Percentile (0–100) of the training rolling signed imbalance distribution
+   * used as the directional threshold inside predict().
+   * p75 means: direction=long only when imbalance exceeds the 75th percentile
+   * of the training imbalance series; direction=short when below the 25th.
+   * Default 75.
+   */
+  imbalancePercentile?: number;
 }
 
 const DEFAULTS: Required<DetectorConfig> = {
-  windowSize:   50,
-  hazardLambda: 200,
-  cusumKSigmas: 0.5,
-  cusumHSigmas: 5,
-  scoreWeights: [0.4, 0.3, 0.3],
+  windowSize:          50,
+  hazardLambda:        200,
+  cusumKSigmas:        0.5,
+  cusumHSigmas:        5,
+  scoreWeights:        [0.4, 0.3, 0.3],
+  imbalancePercentile: 75,
 };
 
 // ─── Trained model bundle ─────────────────────────────────────────────────────
 
 interface TrainedModels {
-  hawkesParams:  HawkesParams;
-  cusumParams:   CusumParams;
-  bocpdPrior:    NormalGammaPrior;
+  hawkesParams:        HawkesParams;
+  cusumParams:         CusumParams;
+  bocpdPrior:          NormalGammaPrior;
+  /** p(imbalancePercentile) of the training rolling signed imbalance series */
+  imbalanceThreshold:  number;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Linear-interpolation quantile (standard type 7). p in [0, 100]. */
+function quantile(arr: number[], p: number): number {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx    = (p / 100) * (sorted.length - 1);
+  const lo     = Math.floor(idx);
+  const hi     = Math.ceil(idx);
+  if (lo === hi) return sorted[lo]!;
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (idx - lo);
 }
 
 // ─── Detector class ───────────────────────────────────────────────────────────
@@ -101,7 +124,15 @@ export class VolumeAnomalyDetector {
     const vari = n > 0 ? absImbalance.reduce((s, x) => s + (x - mean) ** 2, 0) / n : 0;
     const bocpdPrior = defaultPrior(mean, vari);
 
-    this.models = { hawkesParams, cusumParams, bocpdPrior };
+    // ── Directional threshold: p(imbalancePercentile) of rolling signed imbalance.
+    // Uses signed (not absolute) series so trending markets produce an elevated
+    // threshold that reflects actual baseline buy/sell bias.
+    const signedImbalance    = this.rollingSignedImbalance(sorted);
+    const imbalanceThreshold = signedImbalance.length > 0
+      ? quantile(signedImbalance, this.cfg.imbalancePercentile)
+      : 0.3;
+
+    this.models = { hawkesParams, cusumParams, bocpdPrior, imbalanceThreshold };
   }
 
   // ─── Detection ──────────────────────────────────────────────────────────────
@@ -234,6 +265,15 @@ export class VolumeAnomalyDetector {
     const out: number[] = [];
     for (let i = w; i <= sorted.length; i++) {
       out.push(Math.abs(volumeImbalance(sorted.slice(i - w, i))));
+    }
+    return out;
+  }
+
+  private rollingSignedImbalance(sorted: IAggregatedTradeData[]): number[] {
+    const w   = this.cfg.windowSize;
+    const out: number[] = [];
+    for (let i = w; i <= sorted.length; i++) {
+      out.push(volumeImbalance(sorted.slice(i - w, i)));
     }
     return out;
   }
