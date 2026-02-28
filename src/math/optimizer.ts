@@ -29,12 +29,10 @@ export function nelderMead(
   let fvals = simplex.map(f);
 
   const sortSimplex = () => {
-    const idx = fvals.map((_, i) => i).sort((a, b) => fvals[a]! - fvals[b]!);
-    fvals = idx.map((i) => fvals[i]!);
-    for (let i = 0; i <= n; i++) simplex[i] = idx.map((j) => simplex[j]![i] as number);
-    // rebuild rows
-    const rows: number[][] = idx.map((j) => simplex[j] as unknown as number[]);
-    for (let i = 0; i <= n; i++) simplex[i] = rows[i]!;
+    const idx  = fvals.map((_, i) => i).sort((a, b) => fvals[a]! - fvals[b]!);
+    const rows = idx.map((i) => simplex[i]!);
+    const vals = idx.map((i) => fvals[i]!);
+    for (let i = 0; i <= n; i++) { simplex[i] = rows[i]!; fvals[i] = vals[i]!; }
   };
 
   // NM parameters

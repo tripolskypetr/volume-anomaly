@@ -50,15 +50,18 @@ export function hawkesLogLikelihood(
   const n = timestamps.length;
   if (n === 0) return 0;
 
-  const T = timestamps[n - 1]!;
+  // Use observation window length, not absolute time, so the LL is invariant
+  // to timestamp origin (works for both t0=0 and Unix-epoch seconds).
+  const t0 = timestamps[0]!;
+  const T  = timestamps[n - 1]! - t0;  // window length
   let ll   = -mu * T;
   let A    = 0; // recursive compensator
 
   for (let i = 0; i < n; i++) {
-    const ti = timestamps[i]!;
+    const ti = timestamps[i]! - t0;    // shift to origin
 
     if (i > 0) {
-      const dt = ti - timestamps[i - 1]!;
+      const dt = ti - (timestamps[i - 1]! - t0);
       A = Math.exp(-beta * dt) * (1 + A);
     }
 

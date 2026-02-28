@@ -351,6 +351,104 @@ describe('per-detector isolation', () => {
   });
 });
 
+// ─── Seeded integration test ─────────────────────────────────────────────────
+//
+// Uses a deterministic LCG (linear congruential generator) so the stream is
+// fully reproducible across runs without any external dependency.
+//
+// Stream layout (all timestamps in ms):
+//
+//   [0 .. HIST_END)       — calm market, used for training
+//   [HIST_END .. PRE_END) — additional calm window evaluated BEFORE the anomaly
+//   [ANOMALY_START)       — synthetic anomaly injected at a known position:
+//                           arrival burst (10× rate) + heavy buy imbalance
+//   [POST_START .. POST_END) — calm window evaluated AFTER the anomaly
+//
+// The test asserts:
+//   1. detector.detect(pre-anomaly window)  → anomaly = false
+//   2. detector.detect(anomaly window)      → anomaly = true
+//   3. detector.detect(post-anomaly window) → anomaly = false
+//
+// This proves the detector is temporally precise: it fires at the right moment
+// and does not bleed into adjacent calm windows.
+
+describe('seeded integration — known anomaly position', () => {
+  // ── Minimal LCG — Numerical Recipes constants ────────────────────────────
+  function makeLCG(seed: number) {
+    let s = seed >>> 0;
+    return () => {
+      s = Math.imul(1664525, s) + 1013904223;
+      return (s >>> 0) / 0xFFFFFFFF;
+    };
+  }
+
+  // ── Trade stream builder ─────────────────────────────────────────────────
+  interface StreamSegment {
+    count:        number;
+    intervalMs:   number;  // average ms between trades
+    buyFraction:  number;  // fraction of buy aggressors  [0,1]
+    jitter:       number;  // ±fraction of intervalMs for timing noise
+  }
+
+  function buildStream(
+    segments: StreamSegment[],
+    startTs:  number,
+    rng:      () => number,
+  ): IAggregatedTradeData[] {
+    const trades: IAggregatedTradeData[] = [];
+    let ts = startTs;
+    for (const seg of segments) {
+      for (let i = 0; i < seg.count; i++) {
+        const interval    = seg.intervalMs * (1 - seg.jitter + rng() * seg.jitter * 2);
+        ts               += interval;
+        const isBuyerMaker = rng() > seg.buyFraction;  // false = buy aggressor
+        const qty          = 0.5 + rng() * 1.5;
+        trades.push(makeTrade(Math.round(ts), qty, isBuyerMaker));
+      }
+    }
+    return trades;
+  }
+
+  it('detects injected anomaly window, quiet before and after', () => {
+    const SEED = 0xDEADBEEF;
+    const rng  = makeLCG(SEED);
+
+    // ── Build the full stream ──────────────────────────────────────────────
+    //
+    // Calm segments: ~1 trade/s, balanced (buyFraction = 0.5).
+    // Anomaly: 10× arrival rate + 90% buy aggressors (heavy buy pressure).
+
+    const CALM:    StreamSegment = { count: 0,   intervalMs: 1000, buyFraction: 0.5,  jitter: 0.3 };
+    const ANOMALY: StreamSegment = { count: 200, intervalMs: 100,  buyFraction: 0.9,  jitter: 0.1 };
+
+    const hist    = buildStream([{ ...CALM, count: 500 }], 0,         rng);
+    const pre     = buildStream([{ ...CALM, count: 150 }], 500_000,   rng);
+    const anomaly = buildStream([ANOMALY],                 650_000,   rng);
+    const post    = buildStream([{ ...CALM, count: 150 }], 670_000,   rng);
+
+    // ── Train on calm history ──────────────────────────────────────────────
+    const detector = new VolumeAnomalyDetector({ windowSize: 20 });
+    detector.train(hist);
+
+    // ── Evaluate three windows ─────────────────────────────────────────────
+    const resPre     = detector.detect(pre,     0.75);
+    const resAnomaly = detector.detect(anomaly, 0.75);
+    const resPost    = detector.detect(post,    0.75);
+
+    // 1. Pre-anomaly: should be quiet
+    expect(resPre.anomaly).toBe(false);
+
+    // 2. Anomaly window: should fire
+    expect(resAnomaly.anomaly).toBe(true);
+
+    // 3. Post-anomaly: should return to quiet (no bleed-over)
+    expect(resPost.anomaly).toBe(false);
+
+    // 4. Anomaly window direction: heavy buy pressure → positive imbalance
+    expect(resAnomaly.imbalance).toBeGreaterThan(0.5);
+  });
+});
+
 // ─── Functional API ───────────────────────────────────────────────────────────
 
 describe('detect() functional API', () => {
