@@ -3,28 +3,36 @@
   "version": "0.1.0",
   "description": "Volume anomaly detection via Hawkes, CUSUM, BOCPD",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./build/index.cjs",
+  "module": "./build/index.mjs",
+  "types": "./types.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    },
-    "./math": {
-      "import": "./dist/math/index.js",
-      "types": "./dist/math/index.d.ts"
+      "types": "./types.d.ts",
+      "import": "./build/index.mjs",
+      "require": "./build/index.cjs"
     }
   },
+  "files": [
+    "build",
+    "types.d.ts",
+    "README.md"
+  ],
   "scripts": {
-    "build": "tsc",
+    "build": "rollup -c",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.4.0",
-    "vitest": "^1.6.0",
-    "@vitest/coverage-v8": "^1.6.0"
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@types/node": "^20.10.0",
+    "@vitest/coverage-v8": "^1.6.1",
+    "rollup": "^4.57.1",
+    "rollup-plugin-dts": "^6.3.0",
+    "rollup-plugin-peer-deps-external": "^2.2.4",
+    "tslib": "^2.8.1",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
   }
 }

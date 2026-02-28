@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="https://github.com/tripolskypetr/volume-anomaly/raw/master/assets/logo.png" height="115px" alt="garch" />
+</p>
+
+<p align="center">
   <strong>Volume anomaly detection for trade streams</strong><br>
   Hawkes Process · CUSUM · Bayesian Online Changepoint Detection<br>
   TypeScript. Zero dependencies.

@@ -11,12 +11,12 @@
  */
 
 import type { IAggregatedTradeData, DetectionResult, AnomalySignal } from './types.js';
-import type { CusumParams, CusumState }         from './types.js';
+import type { CusumState }         from './types.js';
 import type { BocpdState, NormalGammaPrior }     from './math/bocpd.js';
 import type { HawkesParams }                     from './types.js';
 
 import { volumeImbalance, hawkesFit, hawkesLambda, hawkesAnomalyScore } from './math/hawkes.js';
-import { cusumFit, cusumUpdate, cusumInitState, cusumAnomalyScore }      from './math/cusum.js';
+import { cusumFit, cusumUpdate, cusumInitState, cusumAnomalyScore, CusumParams }      from './math/cusum.js';
 import { bocpdUpdate, bocpdInitState, bocpdAnomalyScore, defaultPrior }  from './math/bocpd.js';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
