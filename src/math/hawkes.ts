@@ -112,6 +112,21 @@ export function hawkesFit(timestamps: number[]): HawkesFitResult {
   const result = nelderMead(negLL, x0, { maxIter: 1000, tol: 1e-8 });
   const [mu, alpha, beta] = result.x;
 
+  // If the optimizer landed in the penalty region, fall back to a safe
+  // near-Poisson parameterisation so downstream scoring stays conservative.
+  const invalid = !result.converged || result.fx >= 1e9
+    || mu! <= 0 || alpha! <= 0 || beta! <= 0 || alpha! >= beta!;
+
+  if (invalid) {
+    const muFallback = timestamps.length / (T || 1);
+    return {
+      params:       { mu: muFallback, alpha: muFallback * 0.01, beta: muFallback },
+      logLik:       -Infinity,
+      stationarity: 0.01,
+      converged:    false,
+    };
+  }
+
   const params: HawkesParams = { mu: mu!, alpha: alpha!, beta: beta! };
   return {
     params,

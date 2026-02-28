@@ -142,6 +142,62 @@ describe('VolumeAnomalyDetector', () => {
   });
 });
 
+// ─── False positive rate ──────────────────────────────────────────────────────
+
+describe('false positive rate', () => {
+  /**
+   * Train and detect on data drawn from the same stationary distribution.
+   * At the default threshold 0.75 the detector must NOT fire on calm, balanced
+   * flow — a false positive here means a spurious trade entry and a direct loss.
+   *
+   * The test uses a deterministic "pseudo-random" sequence (sine-modulated
+   * intervals and alternating buy/sell) so the result is stable across runs.
+   */
+  it('does not fire on calm, balanced, same-distribution window', () => {
+    const detector = new VolumeAnomalyDetector({ windowSize: 20 });
+
+    // Deterministic historical window: balanced buy/sell, steady 1 s intervals
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 300; i++) {
+      const ts           = i * 1000 + (i % 7) * 10;   // slight jitter, no spikes
+      const isBuyerMaker = i % 2 === 0;                // perfectly balanced
+      const qty          = 1 + (i % 3) * 0.5;         // qty in {1, 1.5, 2}
+      hist.push(makeTrade(ts, qty, isBuyerMaker));
+    }
+
+    // Recent window: same distribution, just shifted in time
+    const recent: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 100; i++) {
+      const ts           = 300_000 + i * 1000 + (i % 7) * 10;
+      const isBuyerMaker = i % 2 === 0;
+      const qty          = 1 + (i % 3) * 0.5;
+      recent.push(makeTrade(ts, qty, isBuyerMaker));
+    }
+
+    detector.train(hist);
+    const result = detector.detect(recent, 0.75);
+
+    expect(result.anomaly).toBe(false);
+  });
+
+  it('hawkesParams are valid (subcritical) after fitting on calm data', () => {
+    const detector = new VolumeAnomalyDetector({ windowSize: 20 });
+
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 300; i++) {
+      hist.push(makeTrade(i * 1000, 1, i % 2 === 0));
+    }
+    detector.train(hist);
+
+    const { hawkesParams } = detector.trainedModels!;
+    expect(hawkesParams.mu).toBeGreaterThan(0);
+    expect(hawkesParams.alpha).toBeGreaterThan(0);
+    expect(hawkesParams.beta).toBeGreaterThan(0);
+    // subcritical — otherwise hawkesAnomalyScore always returns 1
+    expect(hawkesParams.alpha / hawkesParams.beta).toBeLessThan(1);
+  });
+});
+
 // ─── Functional API ───────────────────────────────────────────────────────────
 
 describe('detect() functional API', () => {

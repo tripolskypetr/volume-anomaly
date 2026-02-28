@@ -43,9 +43,10 @@ export function nelderMead(
   for (let iter = 0; iter < maxIter; iter++) {
     sortSimplex();
 
-    // Convergence check
+    // Convergence check — exclude penalty-wall values (≥ 1e9) to avoid
+    // false convergence when all vertices are stuck in the infeasible region.
     const spread = fvals[n]! - fvals[0]!;
-    if (spread < tol) {
+    if (spread < tol && fvals[0]! < 1e9) {
       return { x: simplex[0]!, fx: fvals[0]!, iters: iter, converged: true };
     }
 
