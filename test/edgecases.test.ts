@@ -313,6 +313,57 @@ describe('bocpdUpdate: pruning threshold -30', () => {
   });
 });
 
+// ─── 7. БАГ: windowSize > train size → bocpdPrior.mu0 = NaN ──────────────────
+//
+// detector.ts:99-100 — mean и vari вычислялись на пустом absImbalance[].
+// При windowSize > trades.length: rollingAbsImbalance возвращает [].
+// 0 / 0 = NaN → bocpdPrior.mu0 = NaN → BOCPD работает с NaN prior.
+// Фикс: guard `n > 0 ? ... : 0` вместо прямого деления.
+
+describe('regression: windowSize > train trades does not produce NaN', () => {
+  function hist(n: number): IAggregatedTradeData[] {
+    return Array.from({ length: n }, (_, i) => trade(i * 1000, 1, i % 2 === 0));
+  }
+
+  it('windowSize=100, train 50 trades → bocpdPrior.mu0 is finite (was NaN)', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 100 });
+    det.train(hist(50));
+    const mu0 = (det.trainedModels as any)?.bocpdPrior?.mu0;
+    expect(Number.isNaN(mu0)).toBe(false);
+    expect(Number.isFinite(mu0)).toBe(true);
+  });
+
+  it('windowSize=100, train 50 trades → detect() returns finite confidence', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 100 });
+    det.train(hist(50));
+    const rec = Array.from({ length: 10 }, (_, i) => trade(200_000 + i * 1000, 1, i % 2 === 0));
+    const r   = det.detect(rec);
+    expect(Number.isNaN(r.confidence)).toBe(false);
+    expect(Number.isFinite(r.confidence)).toBe(true);
+    expect(r.confidence).toBeGreaterThanOrEqual(0);
+    expect(r.confidence).toBeLessThanOrEqual(1);
+  });
+
+  it('windowSize=50, train 50 trades (1 rolling window) → mu0 finite', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 50 });
+    det.train(hist(50));
+    const mu0 = (det.trainedModels as any)?.bocpdPrior?.mu0;
+    expect(Number.isNaN(mu0)).toBe(false);
+  });
+
+  it('windowSize=200, train 50 trades (extreme: w >> n) → no NaN anywhere', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 200 });
+    det.train(hist(50));
+    const mu0   = (det.trainedModels as any)?.bocpdPrior?.mu0;
+    const beta0 = (det.trainedModels as any)?.bocpdPrior?.beta0;
+    expect(Number.isNaN(mu0)).toBe(false);
+    expect(Number.isNaN(beta0)).toBe(false);
+    // mu0 = 0 (fallback), beta0 = 1 (defaultPrior fallback for var=0)
+    expect(mu0).toBe(0);
+    expect(beta0).toBe(1);
+  });
+});
+
 // ─── 7. trainedModels геттер ─────────────────────────────────────────────────
 //
 // detector.ts:258-261 — `get trainedModels(): Readonly<TrainedModels> | null`

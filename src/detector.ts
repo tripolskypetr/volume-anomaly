@@ -96,8 +96,9 @@ export class VolumeAnomalyDetector {
     const absImbalance = this.rollingAbsImbalance(sorted);
     const cusumParams  = cusumFit(absImbalance, this.cfg.cusumKSigmas, this.cfg.cusumHSigmas);
 
-    const mean = absImbalance.reduce((s, x) => s + x, 0) / absImbalance.length;
-    const vari = absImbalance.reduce((s, x) => s + (x - mean) ** 2, 0) / absImbalance.length;
+    const n    = absImbalance.length;
+    const mean = n > 0 ? absImbalance.reduce((s, x) => s + x, 0) / n : 0;
+    const vari = n > 0 ? absImbalance.reduce((s, x) => s + (x - mean) ** 2, 0) / n : 0;
     const bocpdPrior = defaultPrior(mean, vari);
 
     this.models = { hawkesParams, cusumParams, bocpdPrior };
