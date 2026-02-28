@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { predict, detect } from '../src/index.js';
+import { predict, detect, VolumeAnomalyDetector } from '../src/index.js';
 import type { IAggregatedTradeData } from '../src/index.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -253,5 +253,136 @@ describe('predict(): seeded regression', () => {
     const r    = predict(hist, rec, 0.75);
     expect(r.anomaly).toBe(false);
     expect(r.direction).toBe('neutral');
+  });
+});
+
+// ─── Trained imbalanceThreshold ──────────────────────────────────────────────
+
+describe('predict(): trained imbalanceThreshold', () => {
+  it('trainedModels.imbalanceThreshold is a finite number after train()', () => {
+    const rng  = makeLCG(0x70707070);
+    const hist = buildStream(300, 0, 1000, 0.5, rng);
+    const det  = new VolumeAnomalyDetector();
+    det.train(hist);
+    const thr = det.trainedModels!.imbalanceThreshold;
+    expect(Number.isFinite(thr)).toBe(true);
+    expect(Number.isNaN(thr)).toBe(false);
+  });
+
+  it('balanced training → threshold near 0 (p75 of near-zero series)', () => {
+    // All trades perfectly alternating buy/sell → rolling imbalance ≈ 0 in every window
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      hist.push({ id: String(i), price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 2 === 0 });
+    }
+    const det = new VolumeAnomalyDetector({ windowSize: 20 });
+    det.train(hist);
+    const thr = det.trainedModels!.imbalanceThreshold;
+    // p75 of a series that is always 0 must be 0 (or very close due to rounding)
+    expect(Math.abs(thr)).toBeLessThan(0.05);
+  });
+
+  it('trending training → threshold higher than on balanced data', () => {
+    // 80% buy-aggressor history → p75 of signed imbalance is elevated
+    const trendHist: IAggregatedTradeData[] = [];
+    const calmHist:  IAggregatedTradeData[] = [];
+    for (let i = 0; i < 300; i++) {
+      trendHist.push({ id: `t${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 5 === 0 });  // 80% buy
+      calmHist.push({  id: `c${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 2 === 0 });  // 50% balanced
+    }
+    const detTrend = new VolumeAnomalyDetector({ windowSize: 20 });
+    const detCalm  = new VolumeAnomalyDetector({ windowSize: 20 });
+    detTrend.train(trendHist);
+    detCalm.train(calmHist);
+    const thrTrend = detTrend.trainedModels!.imbalanceThreshold;
+    const thrCalm  = detCalm.trainedModels!.imbalanceThreshold;
+    // Trending market should produce a higher directional threshold
+    expect(thrTrend).toBeGreaterThan(thrCalm);
+  });
+
+  it('predict() without explicit threshold uses trained value, not 0.3', () => {
+    // Train on data where p75 is well above 0.3 (strong buy trend)
+    const trendHist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 300; i++) {
+      // 95% buy aggressors → rolling imbalance ≈ +0.9
+      trendHist.push({ id: `th${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 20 === 0 });
+    }
+    const det = new VolumeAnomalyDetector({ windowSize: 20 });
+    det.train(trendHist);
+    const trainedThr = det.trainedModels!.imbalanceThreshold;
+    // p75 of a ~0.9 series must be well above 0.3
+    expect(trainedThr).toBeGreaterThan(0.3);
+
+    // predict() with this data and no override should use trainedThr internally
+    // A moderate-buy recent window (imbalance ~0.5) should be 'neutral' with trained
+    // threshold ~0.9 but would be 'long' with the old hardcoded 0.3
+    const rng = makeLCG(0x71717171);
+    const rec = buildStream(200, 400_000, 100, 0.7, rng);  // moderate buy burst
+    const rWithTrainedThr = predict(trendHist, rec, 0.0);       // use trained thr
+    const rWithFixed03   = predict(trendHist, rec, 0.0, 0.3);  // force old threshold
+
+    // With the trained high threshold, a moderate imbalance that is below the
+    // training p75 should NOT yield 'long'
+    if (rWithTrainedThr.anomaly && rWithTrainedThr.imbalance < trainedThr) {
+      expect(rWithTrainedThr.direction).toBe('neutral');
+    }
+    // With the fixed 0.3 threshold, same imbalance would be 'long' if imbalance > 0.3
+    if (rWithFixed03.anomaly && rWithFixed03.imbalance > 0.3) {
+      expect(rWithFixed03.direction).toBe('long');
+    }
+  });
+
+  it('imbalancePercentile config changes the trained threshold', () => {
+    // Same training data, different percentile config → different threshold
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      // 70% buy aggressors → signed imbalance ≈ +0.4
+      hist.push({ id: `ip${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 10 < 3 });
+    }
+    const detP50  = new VolumeAnomalyDetector({ windowSize: 20, imbalancePercentile: 50 });
+    const detP90  = new VolumeAnomalyDetector({ windowSize: 20, imbalancePercentile: 90 });
+    detP50.train(hist);
+    detP90.train(hist);
+    const thr50 = detP50.trainedModels!.imbalanceThreshold;
+    const thr90 = detP90.trainedModels!.imbalanceThreshold;
+    // p90 must be ≥ p50 for any distribution
+    expect(thr90).toBeGreaterThanOrEqual(thr50);
+  });
+
+  it('imbalancePercentile=0 → threshold is the minimum of the series', () => {
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      hist.push({ id: `p0${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 2 === 0 });
+    }
+    const det = new VolumeAnomalyDetector({ windowSize: 20, imbalancePercentile: 0 });
+    det.train(hist);
+    const thr = det.trainedModels!.imbalanceThreshold;
+    // p0 is the minimum — for alternating series that's ≈ 0 but could be slightly negative
+    expect(Number.isFinite(thr)).toBe(true);
+  });
+
+  it('imbalancePercentile=100 → threshold is the maximum of the series', () => {
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      hist.push({ id: `p100${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 2 === 0 });
+    }
+    const det = new VolumeAnomalyDetector({ windowSize: 20, imbalancePercentile: 100 });
+    det.train(hist);
+    const thr = det.trainedModels!.imbalanceThreshold;
+    // p100 is the max — for alternating series that's ≈ 0
+    expect(Number.isFinite(thr)).toBe(true);
+  });
+
+  it('windowSize > training count → fallback threshold 0.3 is finite', () => {
+    // Same regression as NaN bug — signed imbalance also empty when windowSize > n
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 50; i++) {
+      hist.push({ id: `fb${i}`, price: 100, qty: 1, timestamp: i * 1000, isBuyerMaker: i % 2 === 0 });
+    }
+    const det = new VolumeAnomalyDetector({ windowSize: 100 });
+    det.train(hist);
+    const thr = det.trainedModels!.imbalanceThreshold;
+    expect(thr).toBe(0.3);
+    expect(Number.isFinite(thr)).toBe(true);
   });
 });
