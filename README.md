@@ -86,7 +86,7 @@ const detector = new VolumeAnomalyDetector({
   windowSize:   50,          // trades per imbalance window
   hazardLambda: 200,         // expected periods between changepoints
   cusumKSigmas: 0.5,         // CUSUM slack k = 0.5 · σ
-  cusumHSigmas: 4,           // CUSUM alarm h = 4 · σ
+  cusumHSigmas: 5,           // CUSUM alarm h = 5 · σ
   scoreWeights: [0.4, 0.3, 0.3], // [Hawkes, CUSUM, BOCPD]
 });
 
@@ -104,7 +104,7 @@ const { hawkesParams, cusumParams, bocpdPrior } = detector.trainedModels!;
 | `windowSize` | `number` | `50` | Number of trades per rolling imbalance window. Smaller = more reactive to local shifts, larger = smoother signal |
 | `hazardLambda` | `number` | `200` | Expected number of windows between changepoints (BOCPD hazard rate H = 1/λ). Set lower for more frequent regime changes |
 | `cusumKSigmas` | `number` | `0.5` | CUSUM allowable slack k in σ units. Controls sensitivity: lower k = faster response but more false positives |
-| `cusumHSigmas` | `number` | `4` | CUSUM alarm threshold h in σ units. Higher h = fewer but more confident alarms (ARL₀ ≈ 500–1000 at h = 4–5σ) |
+| `cusumHSigmas` | `number` | `5` | CUSUM alarm threshold h in σ units. Higher h = fewer but more confident alarms (ARL₀ ≈ 148 at h = 5σ) |
 | `scoreWeights` | `[n, n, n]` | `[0.4, 0.3, 0.3]` | Weights for [Hawkes, CUSUM, BOCPD] scores. Must sum to 1 |
 
 ---
@@ -282,7 +282,7 @@ h    = cusumHSigmas · σ₀       (default 4σ)
 ARL₀ ≈ exp(2·k·h / σ₀²)
 ```
 
-At the defaults `k = 0.5σ`, `h = 4σ`: `ARL₀ ≈ exp(4) ≈ 55`. Raising `cusumHSigmas` to 5 gives `ARL₀ ≈ exp(5) ≈ 148`. Raising to 6 gives `ARL₀ ≈ e⁶ ≈ 403`. This is why the default of `4` fires relatively quickly after a shift, while `6` gives rare, high-confidence alarms only.
+At the defaults `k = 0.5σ`, `h = 5σ`: `ARL₀ ≈ exp(5) ≈ 148`. Raising `cusumHSigmas` to 6 gives `ARL₀ ≈ e⁶ ≈ 403`. Lowering to 4 gives `ARL₀ ≈ exp(4) ≈ 55` — fires quickly but with more false positives.
 
 **CUSUM anomaly score:**
 

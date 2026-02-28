@@ -180,6 +180,42 @@ describe('false positive rate', () => {
     expect(result.anomaly).toBe(false);
   });
 
+  it('buy-side and sell-side pressure produce equal confidence (BOCPD symmetry)', () => {
+    // Both detectors that use imbalance (CUSUM, BOCPD) operate on |imbalance|.
+    // A +0.8 buy surge and a -0.8 sell surge must produce identical confidence scores
+    // — the direction is reported via result.imbalance, not baked into the anomaly score.
+    const makeHistory = () => {
+      const hist: IAggregatedTradeData[] = [];
+      for (let i = 0; i < 300; i++) {
+        hist.push(makeTrade(i * 1000, 1, i % 2 === 0));
+      }
+      return hist;
+    };
+
+    const makePressure = (startTs: number, isBuy: boolean) => {
+      const trades: IAggregatedTradeData[] = [];
+      for (let i = 0; i < 100; i++) {
+        // isBuyerMaker=false → buy aggressor; true → sell aggressor
+        trades.push(makeTrade(startTs + i * 500, 1, !isBuy));
+      }
+      return trades;
+    };
+
+    const hist = makeHistory();
+
+    const detectorBuy  = new VolumeAnomalyDetector({ windowSize: 20 });
+    const detectorSell = new VolumeAnomalyDetector({ windowSize: 20 });
+    detectorBuy.train(hist);
+    detectorSell.train(hist);
+
+    const buyResult  = detectorBuy.detect(makePressure(300_000, true),  0.0);
+    const sellResult = detectorSell.detect(makePressure(300_000, false), 0.0);
+
+    expect(buyResult.confidence).toBeCloseTo(sellResult.confidence, 6);
+    expect(buyResult.imbalance).toBeGreaterThan(0);
+    expect(sellResult.imbalance).toBeLessThan(0);
+  });
+
   it('hawkesParams are valid (subcritical) after fitting on calm data', () => {
     const detector = new VolumeAnomalyDetector({ windowSize: 20 });
 
