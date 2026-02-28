@@ -159,19 +159,81 @@ export function hawkesLambda(
   return mu + alpha * sum;
 }
 
+/**
+ * Compute the peak conditional intensity over all events in the window.
+ *
+ * Uses the O(n) recursive A(i) trick from the log-likelihood:
+ *   A(i) = exp(−β·Δᵢ) · (1 + A(i−1))
+ *   λ(tᵢ) = μ + α·A(i)
+ *
+ * Taking the maximum over all events (not just the last one) is essential
+ * for detecting bursts that occur in the middle of a detection window — at
+ * the last event the kernel has already decayed, so λ(t_last) can be close
+ * to μ even when a spike occurred earlier.
+ *
+ * timestamps must be sorted ascending (in seconds, same unit as params).
+ */
+export function hawkesPeakLambda(
+  timestamps: number[],
+  params: HawkesParams,
+): number {
+  const { mu, alpha, beta } = params;
+  const n = timestamps.length;
+  if (n === 0) return mu;
+
+  let A    = 0;
+  let peak = mu; // λ before first event = μ
+
+  for (let i = 0; i < n; i++) {
+    if (i > 0) {
+      const dt = timestamps[i]! - timestamps[i - 1]!;
+      A = Math.exp(-beta * dt) * (1 + A);
+    }
+    const lam = mu + alpha * A;
+    if (lam > peak) peak = lam;
+  }
+  return peak;
+}
+
 // ─── Anomaly score from Hawkes ────────────────────────────────────────────────
 
 /**
- * Normalised score [0,1]: how much the current λ exceeds the unconditional mean.
- * Unconditional mean: E[λ] = μ / (1 − α/β)  (subcritical Hawkes)
+ * Normalised score [0,1]: how much the arrival rate exceeds the baseline.
+ *
+ * Two complementary signals are combined with max():
+ *
+ *  1. Intensity ratio: peakLambda / E[λ].
+ *     E[λ] = μ/(1−α/β) — the unconditional mean of the fitted process.
+ *     Captures self-excitation bursts when the MLE branching ratio is large.
+ *
+ *  2. Empirical rate ratio: empiricalRate / μ.
+ *     Compares the raw arrival density in the detection window to the fitted
+ *     baseline rate μ. This is model-agnostic and fires even when the MLE
+ *     assigns alpha ≈ 0 (Poisson baseline), where the intensity ratio stays
+ *     near 1 regardless of how many events arrived.
+ *
+ * Both ratios are fed through the same sigmoid centred at 2× baseline, so
+ * the score is 0 at baseline rate, 0.5 at 2×, and approaches 1 at ≥ 4×.
+ *
+ * @param peakLambda    Peak λ(tᵢ) over the detection window (from hawkesPeakLambda).
+ * @param params        Fitted Hawkes parameters.
+ * @param empiricalRate Observed arrival rate in the detection window (events/s).
+ *                      Pass 0 to use only the intensity ratio.
  */
 export function hawkesAnomalyScore(
-  lambda: number,
+  peakLambda: number,
   params: HawkesParams,
+  empiricalRate = 0,
 ): number {
-  const branching = params.alpha / params.beta;
+  const branching  = params.alpha / params.beta;
   if (branching >= 1) return 1; // supercritical → always anomalous
   const meanLambda = params.mu / (1 - branching);
-  // sigmoid centred at 2× mean intensity
-  return 1 / (1 + Math.exp(-(lambda / meanLambda - 2) * 2));
+
+  // sigmoid centred at 2× baseline
+  const sig = (ratio: number) => 1 / (1 + Math.exp(-(ratio - 2) * 2));
+
+  const intensityScore = sig(peakLambda / meanLambda);
+  const rateScore      = empiricalRate > 0 ? sig(empiricalRate / params.mu) : 0;
+
+  return Math.max(intensityScore, rateScore);
 }

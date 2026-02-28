@@ -253,7 +253,7 @@ describe('per-detector isolation', () => {
     const trades: IAggregatedTradeData[] = [];
     for (let i = 0; i < n; i++) {
       // Alternating buy/sell of equal qty → |imbalance| ≈ 0 in every window.
-      // Steady 1 s spacing → μ ≈ 1 trade/s, low branching ratio after MLE.
+      // Steady 1 s spacing → μ ≈ 1 trade/s.
       trades.push(makeTrade(i * 1000, 1, i % 2 === 0));
     }
     return trades;
@@ -261,9 +261,14 @@ describe('per-detector isolation', () => {
 
   // ── Hawkes (volume_spike) ──────────────────────────────────────────────────
   //
-  // Trigger: cram many trades into a tiny time window so λ(t_last) >> μ.
-  // Baseline: 1 trade/s → μ ≈ 1.  Recent: 200 trades in 1 s → λ >> 2·μ.
-  // Keep imbalance ≈ 0 (alternating) so CUSUM / BOCPD stay quiet.
+  // Trigger: cram 200 trades into 200 ms (1 ms apart) — 1000× the baseline
+  // rate. The detector uses hawkesPeakLambda which captures the maximum λ(tᵢ)
+  // seen across all events in the window using the O(n) recursive A(i) trick.
+  // Even if alpha ≈ 0 after MLE (Poisson baseline), the term
+  //   λ(tᵢ) = μ + α · A(i)
+  // with A(i) = Σ exp(−β·Δ) accumulates over 200 tightly-spaced events and
+  // yields a peak λ >> μ/(1−α/β), driving hawkesAnomalyScore above 0.5.
+  // Imbalance is alternating so CUSUM / BOCPD stay quiet.
 
   it('Hawkes fires on arrival-rate spike with balanced imbalance', () => {
     const detector = new VolumeAnomalyDetector({

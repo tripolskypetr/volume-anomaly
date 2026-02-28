@@ -15,7 +15,7 @@ import type { NormalGammaPrior }                 from './math/bocpd.js';
 import type { HawkesParams }                     from './types.js';
 import type { CusumState }                       from './types.js';
 
-import { volumeImbalance, hawkesFit, hawkesLambda, hawkesAnomalyScore } from './math/hawkes.js';
+import { volumeImbalance, hawkesFit, hawkesPeakLambda, hawkesAnomalyScore } from './math/hawkes.js';
 import { cusumFit, cusumUpdate, cusumInitState, cusumAnomalyScore, CusumParams }      from './math/cusum.js';
 import { bocpdUpdate, bocpdInitState, bocpdAnomalyScore, defaultPrior }  from './math/bocpd.js';
 
@@ -126,11 +126,18 @@ export class VolumeAnomalyDetector {
     const { hawkesParams, cusumParams, bocpdPrior } = this.models;
     const [wH, wC, wB] = this.cfg.scoreWeights;
 
-    // ── 1. Hawkes intensity at last trade
-    const timestamps  = sorted.map((t) => t.timestamp / 1000);
-    const lastT       = timestamps[timestamps.length - 1]!;
-    const lambda      = hawkesLambda(lastT, timestamps.slice(0, -1), hawkesParams);
-    const hawkesScore = hawkesAnomalyScore(lambda, hawkesParams);
+    // ── 1. Peak Hawkes intensity over the detection window.
+    // hawkesPeakLambda captures the maximum λ(tᵢ) seen at any event in the
+    // window (using the O(n) recursive A-trick), so a burst that decayed by
+    // the last event is still detected.
+    // empiricalRate provides a model-agnostic fallback: even when MLE assigns
+    // alpha ≈ 0 (Poisson baseline), a 1000× arrival surge is clearly anomalous
+    // and the rate ratio fires where the intensity ratio would not.
+    const timestamps    = sorted.map((t) => t.timestamp / 1000);
+    const windowSec     = (timestamps[timestamps.length - 1]! - timestamps[0]!) || 1;
+    const empiricalRate = timestamps.length / windowSec;
+    const lambda        = hawkesPeakLambda(timestamps, hawkesParams);
+    const hawkesScore   = hawkesAnomalyScore(lambda, hawkesParams, empiricalRate);
 
     // ── 2. Current imbalance (full window, signed — for direction reporting)
     const imbalance = volumeImbalance(sorted);
