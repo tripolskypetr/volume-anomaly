@@ -91,6 +91,9 @@ export class VolumeAnomalyDetector {
       if (!config.scoreWeights.every(Number.isFinite)) {
         throw new Error(`scoreWeights must be finite numbers, got ${config.scoreWeights}`);
       }
+      if (config.scoreWeights.some((w) => w < 0)) {
+        throw new Error(`scoreWeights must be non-negative, got ${config.scoreWeights}`);
+      }
       const sum = config.scoreWeights.reduce((a, b) => a + b, 0);
       if (Math.abs(sum - 1) > 1e-6) {
         throw new Error(`scoreWeights must sum to 1, got ${sum}`);
