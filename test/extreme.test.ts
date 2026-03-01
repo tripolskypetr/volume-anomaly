@@ -176,16 +176,13 @@ describe('bocpdUpdate: hazardLambda = Infinity (H = 0) — no changepoints ever'
     }
   });
 
-  it('mapRunLength = 1 on every step (single surviving hypothesis always at position 1)', () => {
-    // With H=0: no cp hypothesis ever survives (logProb = exp(-Inf) = 0).
-    // The single growth hypothesis occupies position 1 in normLogProbs every step,
-    // so mapR = 1 always — even though the underlying run is growing longer.
-    // The suffStats correctly accumulate (n grows), but mapRunLength stays at 1
-    // because the BOCPD state index restarts from 0 after pruning compact the array.
+  it('mapRunLength grows by 1 each step (minRl offset tracks the run across pruning)', () => {
+    // With H=0: the changepoint hypothesis (normLogProbs[0] = −∞) is always pruned.
+    // minRl increments by 1 each step so mapRunLength = state.minRl + mapR = i+1.
     let s = bocpdInitState();
     for (let i = 0; i < 50; i++) {
       const r = bocpdUpdate(s, 0.5, prior, Infinity);
-      expect(r.mapRunLength).toBe(1);
+      expect(r.mapRunLength).toBe(i + 1);
       s = r.state;
     }
   });
@@ -234,13 +231,12 @@ describe('hawkesAnomalyScore: mu = 0 → score stuck at maximum', () => {
     expect(hawkesAnomalyScore(1, { mu: 0, alpha: 0, beta: 1 }, 100)).toBe(1);
   });
 
-  it('mu=0, peakLambda=0, empiricalRate=100: 0/0 = NaN → Math.max(NaN, 1) = NaN (known JS quirk)', () => {
-    // intensityScore: sig(0/0) = sig(NaN) = NaN
-    // rateScore:      sig(100/0) = sig(Inf) = 1
-    // Math.max(NaN, 1) = NaN — JS quirk: any NaN argument makes max return NaN
-    // This is a latent bug: with peakLambda=0 and mu=0 the score silently becomes NaN.
+  it('mu=0, peakLambda=0, empiricalRate=100: intensityScore=0, rateScore=1 → score=1', () => {
+    // meanLambda=0 guard: intensityScore = peakLambda > 0 ? 1 : 0 = 0
+    // mu=0 guard:        rateScore = empiricalRate > 0 ? (mu > 0 ? sig(...) : 1) : 0 = 1
+    // Math.max(0, 1) = 1  (no NaN)
     const score = hawkesAnomalyScore(0, { mu: 0, alpha: 0, beta: 1 }, 100);
-    expect(Number.isNaN(score)).toBe(true);
+    expect(score).toBe(1);
   });
 
   it('mu=Number.MIN_VALUE (5e-324): score = 1 (ratio → Infinity before sig)', () => {

@@ -92,6 +92,18 @@ export interface BocpdState {
   suffStats: NormalGammaSS[];
   /** Total observations processed */
   t:         number;
+  /**
+   * Actual run-length of the hypothesis at logProbs[0] after pruning.
+   *
+   * When the changepoint hypothesis (r=0) and short-run hypotheses are pruned,
+   * the surviving entries are compacted to indices 0, 1, 2, …  Without this
+   * offset the next update would treat logProbs[0] as r=0 (changepoint) again,
+   * silently resetting mapRunLength to 1 on every step.
+   *
+   * Invariant: logProbs[i] represents actual run-length (minRl + i).
+   * Normal usage (hazardLambda finite): r=0 cp always survives → minRl = 0 always.
+   */
+  minRl:     number;
 }
 
 export function bocpdInitState(): BocpdState {
@@ -99,6 +111,7 @@ export function bocpdInitState(): BocpdState {
     logProbs:  [0],           // P(r₀ = 0) = 1  →  log = 0
     suffStats: [ssEmpty()],
     t:         0,
+    minRl:     0,
   };
 }
 
@@ -162,22 +175,32 @@ export function bocpdUpdate(
   const prunedLogProbs  = normLogProbs.filter((_, i) => keep[i]);
   const prunedSuffStats = newSuffStats.filter(  (_, i) => keep[i]);
 
+  // Track actual run-length offset after pruning.
+  // normLogProbs[0] → RL 0; normLogProbs[i] (i>0) → RL state.minRl + i.
+  // When H=0 (hazardLambda=∞) the changepoint entry (i=0) gets log-prob −∞ and is
+  // pruned; the first surviving entry then represents RL state.minRl + firstKept, not 0.
+  const firstKept = keep.indexOf(true);
+  const newMinRl  = firstKept <= 0 ? 0 : state.minRl + firstKept;
+
   const newState: BocpdState = {
     logProbs:  prunedLogProbs,
     suffStats: prunedSuffStats,
     t:         state.t + 1,
+    minRl:     newMinRl,
   };
 
-  // MAP run length (highest probability)
+  // MAP run length: index in normLogProbs → actual run-length.
+  // normLogProbs[0] → RL 0; normLogProbs[r] (r>0) → RL state.minRl + r.
   let mapR = 0;
   let mapLP = -Infinity;
   for (let r = 0; r < normLogProbs.length; r++) {
     if (normLogProbs[r]! > mapLP) { mapLP = normLogProbs[r]!; mapR = r; }
   }
+  const mapRunLength = mapR === 0 ? 0 : state.minRl + mapR;
 
   return {
     state:          newState,
-    mapRunLength:   mapR,
+    mapRunLength,
     cpProbability:  Math.exp(normLogProbs[0] ?? -Infinity),
   };
 }
