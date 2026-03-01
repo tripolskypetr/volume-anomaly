@@ -350,7 +350,7 @@ S⁻ₜ = max(0,  S⁻_{t-1} − xₜ + μ₀ − k)
 μ₀   = mean(|imbalance|)       over the training window
 σ₀²  = var(|imbalance|)        sample variance
 k    = cusumKSigmas · σ₀       (default 0.5σ)
-h    = cusumHSigmas · σ₀       (default 4σ)
+h    = cusumHSigmas · σ₀       (default 5σ)
 ```
 
 **Average run length under H₀ (ARL₀):** the expected number of observations before a false alarm. For Gaussian series, the approximate relationship between h, k and ARL₀ is:
@@ -511,11 +511,12 @@ import {
   hawkesLogLikelihood,
   hawkesFit,
   hawkesLambda,
+  hawkesPeakLambda,  // max λ(tᵢ) over window — used by the detector
   hawkesAnomalyScore,
 
   // CUSUM
   cusumFit,
-  cusumUpdate,       // returns { state, alarm }
+  cusumUpdate,       // returns { state, alarm, preResetState }
   cusumInitState,
   cusumAnomalyScore,
   cusumBatch,
@@ -543,6 +544,10 @@ Returns `{ params, logLik, stationarity, converged }`. `stationarity = α/β`. I
 ### `hawkesLambda(t, timestamps, params)`
 
 Evaluates `λ(t)` at a specific time given a history of prior events. All timestamps must be `< t`.
+
+### `hawkesPeakLambda(timestamps, params)`
+
+Returns the **maximum** `λ(tᵢ)` over all events in `timestamps` using the O(n) recursive A(i) trick. This is what the detector uses internally instead of `hawkesLambda` — a burst that decayed by the last event is still captured. `hawkesLambda` evaluates at a single point; `hawkesPeakLambda` scans the full window.
 
 ### `cusumUpdate(state, x, params)`
 
@@ -572,26 +577,47 @@ BOCPD update is technically O(r_max) where r_max is the number of surviving run-
 
 ---
 
-## Training data guidance
+## Training and detection window sizes
 
-| Trades in historical window | Quality |
-|----------------------------|---------|
-| < 50 | Rejected (throws) |
-| 50–200 | Minimal — CUSUM μ₀/σ₀ estimates unreliable |
-| 200–500 | Adequate for typical use |
-| 500–2000 | Good — stable Hawkes MLE, representative CUSUM baseline |
-| 2000+ | Best — especially important for low-activity pairs |
+### `train()` — historical window
+
+The rolling imbalance series used to calibrate CUSUM and BOCPD has length `max(0, N − windowSize + 1)`. Too few trades → empty or near-empty calibration series → CUSUM baseline is a fallback (μ₀ = 0, σ₀ = 1) and Hawkes MLE is unreliable.
+
+| Trades in `historical` | Rolling windows for calibration¹ | Hawkes MLE | Notes |
+|------------------------|----------------------------------|------------|-------|
+| < 50 | — | — | **Rejected — `train()` throws** |
+| 50–99 | 1–50 | Borderline | CUSUM/BOCPD barely calibrated; Hawkes fallback path active (< 10 events triggers flat Poisson) |
+| 100–199 | 51–150 | Adequate | Practical minimum; mean/σ estimates reasonable |
+| 200–499 | 151–450 | Good | Stable MLE; recommended baseline for liquid pairs |
+| 500–2000 | 451–1951 | Robust | Best calibration; use for low-activity or volatile pairs |
+| > 2000 | > 1951 | Robust | Beware regime staleness — window may span multiple market conditions |
+
+¹ Assumes default `windowSize = 50`.
 
 The training window should represent **normal, in-control market conditions**. Fitting on data that already contains anomalies will inflate the baseline and reduce sensitivity. If your market opens with a gap or major event, use a calmer historical window from the previous session.
 
-**`windowSize` guidance** — the number of trades per rolling imbalance step:
+### `detect()` — recent window
 
-| `windowSize` | Trades in window | Sensitivity | Lag |
-|-------------|-----------------|-------------|-----|
-| 20 | 20 | Very high | Low |
-| 50 (default) | 50 | Balanced | Moderate |
-| 100 | 100 | Lower | Higher |
-| 200 | 200 | Low | High |
+The same rolling logic applies: CUSUM and BOCPD only receive data when `trades ≥ windowSize`. Below that threshold only the Hawkes score contributes, and maximum confidence is `0.4 × hawkesScore ≤ 0.40` — the anomaly flag **cannot fire** at the default threshold of 0.75.
+
+| Trades in `recent` | Rolling windows¹ | All three detectors active | Notes |
+|--------------------|-----------------|---------------------------|-------|
+| < `windowSize` (< 50) | 0 | **No** | Hawkes-only; `anomaly` cannot fire at default threshold |
+| = `windowSize` (= 50) | 1 | Barely | Minimum for full detection; CUSUM/BOCPD signal is very sparse |
+| 2× `windowSize` (100) | 51 | Yes | **Recommended minimum** for production use |
+| 4× `windowSize` (200) | 151 | Yes | Good — default in code examples |
+| 10× `windowSize` (500) | 451 | Yes | Best accuracy; higher latency |
+
+**Rule of thumb:** `recent ≥ 2 × windowSize`. On BTC/USDT perpetual (windowSize = 50), 200 trades typically spans 5–30 seconds and is comfortably available from a real-time buffer.
+
+### `windowSize` guidance
+
+| `windowSize` | Sensitivity | Lag | Minimum `train()` | Minimum `detect()` for full signal |
+|-------------|-------------|-----|-------------------|-------------------------------------|
+| 20 | Very high | Low | 50 trades (code minimum) | 40 trades |
+| 50 (default) | Balanced | Moderate | 100 trades (recommended) | 100 trades |
+| 100 | Lower | Higher | 200 trades | 200 trades |
+| 200 | Low | High | 400 trades | 400 trades |
 
 On high-volume pairs (BTC/USDT perpetual), 50 trades may span only 1–2 seconds. On low-volume pairs, 50 trades may span minutes. Calibrate to the effective time scale that matters for your entry.
 
@@ -641,21 +667,28 @@ async function onCandle(candles: Candle[], recentTrades: IAggregatedTradeData[])
 
 ## Tests
 
-**359 tests** across **11 test files**. All passing.
+**735 tests** across **18 test files**. All passing. 100% statement/function/line coverage, 98.72% branch (two unreachable `??` guards).
 
-| File | Tests | Coverage |
-|------|-------|----------|
+| File | Tests | What is covered |
+|------|-------|-----------------|
 | `hawkes.test.ts` | 20 | Imbalance formula, LL computation, MLE fitting, λ evaluation and decay, anomaly score monotonicity and supercritical clamp |
 | `cusum.test.ts` | 15 | Parameter estimation, state update (pure function), accumulation, alarm + reset, score range, batch detection |
-| `bocpd.test.ts` | 13 | Init state, t increment, probability normalisation, run length growth in stable regime, CP spike on distribution shift, immutability, batch changepoint detection |
-| `detector.test.ts` | 20 | Pre-train guard, isTrained flag, minimum training size, DetectionResult fields, confidence range, empty window, signal score range, functional API determinism |
+| `bocpd.test.ts` | 13 | Init state, update, probability normalisation, run length growth in stable regime, CP spike on distribution shift, immutability, batch |
+| `detector.test.ts` | 20 | Pre-train guard, isTrained flag, minimum training size, DetectionResult fields, confidence range, empty window, signal score range |
 | `detect.test.ts` | 36 | End-to-end anomaly detection, confidence thresholds, signal composition, edge inputs |
 | `seeded.test.ts` | 67 | Deterministic seeded scenarios covering long/short/neutral bursts across parameter space |
-| `predict.test.ts` | 24 | Direction assignment, trained imbalanceThreshold, imbalancePercentile config, trending vs balanced threshold, fallback 0.3 when window > training size |
+| `predict.test.ts` | 24 | Direction assignment, trained imbalanceThreshold, imbalancePercentile config, trending vs balanced threshold |
 | `invariants.test.ts` | 29 | Monotonicity, score bounds, immutability, score weight validation |
 | `adversarial.test.ts` | 58 | Adversarial inputs: NaN propagation, extreme values, Inf timestamps, zero-qty trades |
 | `falsepositive.test.ts` | 18 | Scenarios that must NOT trigger: gradual drift, HFT clusters, trending market, whale trades, overnight gaps |
-| `edgecases.test.ts` | 59 | Boundary conditions, empty arrays, signal threshold exact values, BOCPD pruning, regression for NaN bug |
+| `edgecases.test.ts` | 80 | Boundary conditions, signal threshold exact values (strict >), detect < windowSize bypass, train twice, cusumBatch multiple alarms |
+| `realdata.test.ts` | 23 | Real BTCUSDT-2025-03-01 data: 4 spike windows + 1 calm baseline |
+| `robustness.test.ts` | 66 | Mathematical invariants: range/symmetry/monotonicity for all functions, BOCPD normalisation Σexp(lp) ≤ 1, 100-case property-based detector test |
+| `extreme.test.ts` | 52 | Stuck-at-extremum: hazardLambda edge cases, μ = 0, extreme β, degenerate Nelder-Mead, Welford drift, β₀ = 0 |
+| `newextreme.test.ts` | 58 | NaN propagation in CUSUM/BOCPD, hawkesAnomalyScore extremes, cusumAnomalyScore h = NaN, prevRL = Inf/NaN, kappa0 = 0 |
+| `thirdextreme.test.ts` | 74 | hazardLambda = 0 collapse, β ≤ 0, hawkesFit n = 0/T = 0, hawkesPeakLambda n = 1/β = 0, volumeImbalance NaN qty, cusumFit NaN filter |
+| `fourthextreme.test.ts` | 63 | hawkesAnomalyScore NaN peak + valid params, cusumUpdate NaN params, cusumAnomalyScore NaN state, bocpdUpdate beta0 = Inf, Infinity qty |
+| `perf.test.ts` | 19 | Latency P95 bounds, throughput (detect(200) ≥ 800/s), scaling ratios, stability over 500 sequential calls |
 
 ```bash
 npm test
