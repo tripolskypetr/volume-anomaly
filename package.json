@@ -1,7 +1,7 @@
 {
   "name": "volume-anomaly",
-  "version": "0.1.0",
-  "description": "Volume anomaly detection via Hawkes, CUSUM, BOCPD",
+  "version": "1.0.0",
+  "description": "Statistical volume anomaly detection for trade streams — Hawkes process, CUSUM, and Bayesian Online Changepoint Detection (BOCPD). Zero dependencies. TypeScript.",
   "type": "module",
   "main": "./build/index.cjs",
   "module": "./build/index.mjs",
@@ -24,6 +24,19 @@
     "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
+  "keywords": [
+    "anomaly-detection",
+    "volume",
+    "order-flow",
+    "hawkes-process",
+    "cusum",
+    "bocpd",
+    "changepoint-detection",
+    "trading",
+    "market-microstructure",
+    "typescript",
+    "zero-dependencies"
+  ],
   "devDependencies": {
     "@rollup/plugin-typescript": "^12.3.0",
     "@types/node": "^20.10.0",

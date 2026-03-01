@@ -11,6 +11,23 @@ interface IAggregatedTradeData {
      *  false → buyer is taker (buy aggressor)  */
     isBuyerMaker: boolean;
 }
+/** Trade direction inferred from order-flow imbalance. */
+type Direction = 'long' | 'short' | 'neutral';
+interface PredictionResult {
+    /** true when combined confidence ≥ requested threshold */
+    anomaly: boolean;
+    /** Composite anomaly score [0,1] */
+    confidence: number;
+    /**
+     * Directional signal derived from imbalance:
+     * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression)
+     * - `'short'`   — anomaly + imbalance < −imbalanceThreshold (sell aggression)
+     * - `'neutral'` — no anomaly, or anomaly with balanced order flow (rate-only spike)
+     */
+    direction: Direction;
+    /** Signed imbalance [-1,+1]. Positive = buy-side pressure. */
+    imbalance: number;
+}
 type AnomalyKind = 'volume_spike' | 'imbalance_shift' | 'cusum_alarm' | 'bocpd_changepoint';
 interface AnomalySignal {
     kind: AnomalyKind;
@@ -28,7 +45,7 @@ interface DetectionResult {
     signals: AnomalySignal[];
     /** Estimated imbalance [-1,+1]: positive = buy pressure */
     imbalance: number;
-    /** Hawkes conditional intensity at last observed trade */
+    /** Peak Hawkes conditional intensity λ(tᵢ) seen across all trades in the detection window */
     hawkesLambda: number;
     /** CUSUM statistic (+ side) at last observation */
     cusumStat: number;
@@ -130,11 +147,21 @@ interface DetectorConfig {
      * Must be 3 values [hawkes, cusum, bocpd] summing to 1.
      */
     scoreWeights?: [number, number, number];
+    /**
+     * Percentile (0–100) of the training rolling signed imbalance distribution
+     * used as the directional threshold inside predict().
+     * p75 means: direction=long only when imbalance exceeds the 75th percentile
+     * of the training imbalance series; direction=short when below the 25th.
+     * Default 75.
+     */
+    imbalancePercentile?: number;
 }
 interface TrainedModels {
     hawkesParams: HawkesParams;
     cusumParams: CusumParams;
     bocpdPrior: NormalGammaPrior;
+    /** p(imbalancePercentile) of the training rolling signed imbalance series */
+    imbalanceThreshold: number;
 }
 declare class VolumeAnomalyDetector {
     private readonly cfg;
@@ -153,6 +180,7 @@ declare class VolumeAnomalyDetector {
      */
     detect(trades: IAggregatedTradeData[], confidence?: number): DetectionResult;
     private rollingAbsImbalance;
+    private rollingSignedImbalance;
     private emptyResult;
     get isTrained(): boolean;
     /** Expose fitted parameters (for debugging / serialization) */
@@ -187,6 +215,24 @@ declare class VolumeAnomalyDetector {
  * @param confidence  Required confidence to flag anomaly [0,1]. Default 0.75.
  */
 declare function detect(historical: IAggregatedTradeData[], recent: IAggregatedTradeData[], confidence?: number): DetectionResult;
+/**
+ * One-shot anomaly detection with directional signal.
+ *
+ * Wraps `detect()` and adds a `direction` field derived from `imbalance`:
+ * - `'long'`    — anomaly detected + buy-side order flow dominates
+ * - `'short'`   — anomaly detected + sell-side order flow dominates
+ * - `'neutral'` — no anomaly, or anomaly is a pure rate spike with balanced flow
+ *
+ * The directional threshold is derived automatically from training data:
+ * `imbalanceThreshold = p75 of the rolling signed imbalance series` (configurable
+ * via `DetectorConfig.imbalancePercentile`). Pass an explicit number to override.
+ *
+ * @param historical          Baseline window (≥ 50 trades) for model training.
+ * @param recent              Recent window to evaluate.
+ * @param confidence          Anomaly threshold [0,1]. Default 0.75.
+ * @param imbalanceThreshold  Override the trained threshold. Omit to use p75 from training.
+ */
+declare function predict(historical: IAggregatedTradeData[], recent: IAggregatedTradeData[], confidence?: number, imbalanceThreshold?: number): PredictionResult;
 
-export { VolumeAnomalyDetector, detect };
-export type { AnomalyKind, AnomalySignal, DetectionResult, DetectorConfig, IAggregatedTradeData };
+export { VolumeAnomalyDetector, detect, predict };
+export type { AnomalyKind, AnomalySignal, DetectionResult, DetectorConfig, Direction, IAggregatedTradeData, PredictionResult };

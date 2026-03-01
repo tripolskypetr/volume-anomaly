@@ -641,7 +641,7 @@ async function onCandle(candles: Candle[], recentTrades: IAggregatedTradeData[])
 
 ## Tests
 
-**351 tests** across **11 test files**. All passing.
+**359 tests** across **11 test files**. All passing.
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -651,7 +651,7 @@ async function onCandle(candles: Candle[], recentTrades: IAggregatedTradeData[])
 | `detector.test.ts` | 20 | Pre-train guard, isTrained flag, minimum training size, DetectionResult fields, confidence range, empty window, signal score range, functional API determinism |
 | `detect.test.ts` | 36 | End-to-end anomaly detection, confidence thresholds, signal composition, edge inputs |
 | `seeded.test.ts` | 67 | Deterministic seeded scenarios covering long/short/neutral bursts across parameter space |
-| `predict.test.ts` | 16 | Direction assignment, imbalanceThreshold logic, long/short/neutral cases |
+| `predict.test.ts` | 24 | Direction assignment, trained imbalanceThreshold, imbalancePercentile config, trending vs balanced threshold, fallback 0.3 when window > training size |
 | `invariants.test.ts` | 29 | Monotonicity, score bounds, immutability, score weight validation |
 | `adversarial.test.ts` | 58 | Adversarial inputs: NaN propagation, extreme values, Inf timestamps, zero-qty trades |
 | `falsepositive.test.ts` | 18 | Scenarios that must NOT trigger: gradual drift, HFT clusters, trending market, whale trades, overnight gaps |
