@@ -78,6 +78,12 @@ export function cusumUpdate(
   x:     number,
   params: CusumParams,
 ): CusumUpdateResult {
+  // Non-finite x (NaN, ±Infinity that doesn't trigger alarm) would poison the
+  // accumulators via Math.max(0, NaN) = NaN.  Skip the update entirely for NaN;
+  // ±Infinity is handled naturally (Inf ≥ h → alarm fires and resets state).
+  if (Number.isNaN(x)) {
+    return { alarm: false, preResetState: state, state };
+  }
   const { mu0, k, h } = params;
   const sPos  = Math.max(0, state.sPos + (x - mu0) - k);
   const sNeg  = Math.max(0, state.sNeg - (x - mu0) - k);
@@ -105,7 +111,8 @@ export function cusumInitState(): CusumState {
  */
 export function cusumAnomalyScore(state: CusumState, params: CusumParams): number {
   const s = Math.max(state.sPos, state.sNeg);
-  if (params.h <= 0) return 0;
+  // NaN <= 0 is false in IEEE 754, so guard explicitly against non-finite h.
+  if (params.h <= 0 || !Number.isFinite(params.h)) return 0;
   return Math.min(s / params.h, 1);
 }
 

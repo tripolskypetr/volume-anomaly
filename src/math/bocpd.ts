@@ -198,10 +198,13 @@ export function bocpdUpdate(
   }
   const mapRunLength = mapR === 0 ? 0 : state.minRl + mapR;
 
+  // normLogProbs[0] can be NaN when all log-probs are NaN (e.g. x=NaN, kappa0=0).
+  // `?? -Infinity` only guards undefined/null, not NaN.  Clamp to 0 explicitly.
+  const rawCp = Math.exp(normLogProbs[0] ?? -Infinity);
   return {
     state:          newState,
     mapRunLength,
-    cpProbability:  Math.exp(normLogProbs[0] ?? -Infinity),
+    cpProbability:  Number.isFinite(rawCp) ? rawCp : 0,
   };
 }
 
@@ -234,7 +237,9 @@ export function bocpdUpdate(
  * @param prevRunLength  mapRunLength from the previous bocpdUpdate call.
  */
 export function bocpdAnomalyScore(result: BocpdUpdateResult, prevRunLength = 0): number {
-  if (prevRunLength <= 0) return 0;
+  // NaN <= 0 is false (IEEE 754), and (Infinity - finite) / Infinity = NaN.
+  // Guard both: require prevRunLength to be a finite positive number.
+  if (!Number.isFinite(prevRunLength) || prevRunLength <= 0) return 0;
   const drop = Math.max(0, (prevRunLength - result.mapRunLength) / prevRunLength);
   return 1 / (1 + Math.exp(-(drop - 0.5) * 8));
 }
