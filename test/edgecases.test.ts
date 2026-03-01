@@ -64,6 +64,28 @@ describe('VolumeAnomalyDetector: scoreWeights tolerance boundary', () => {
       scoreWeights: [0.2, 0.2, 0.1],
     })).toThrow('scoreWeights');
   });
+
+  // NaN weights bypass the sum check because |NaN-1|=NaN and NaN>1e-6=false.
+  // Must be caught before the sum check.
+  it('scoreWeights = [NaN, NaN, NaN]: throws (NaN bypasses sum check)', () => {
+    expect(() => new VolumeAnomalyDetector({
+      scoreWeights: [NaN, NaN, NaN],
+    })).toThrow('scoreWeights');
+  });
+
+  it('scoreWeights with one NaN: throws', () => {
+    expect(() => new VolumeAnomalyDetector({
+      scoreWeights: [0.5, NaN, 0.5],
+    })).toThrow('scoreWeights');
+  });
+
+  it('scoreWeights = [Infinity, -Infinity, 0]: throws (Infinity bypasses via sum=NaN)', () => {
+    // sum = Infinity + (-Infinity) + 0 = NaN → same NaN bypass if not guarded.
+    // After fix: isFinite(Infinity) = false → caught.
+    expect(() => new VolumeAnomalyDetector({
+      scoreWeights: [Infinity, -Infinity, 0] as [number, number, number],
+    })).toThrow('scoreWeights');
+  });
 });
 
 // ─── 2. emptyResult: detect([]) возвращает точные нули ───────────────────────
