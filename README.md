@@ -124,6 +124,44 @@ interface PredictionResult {
 }
 ```
 
+**Practical usage with `getAggregatedTrades` from `backtest-kit`:**
+
+> ⚠️ **Never pass the same trades in both `historical` and `recent`.** Training calibrates the baseline. If `recent` overlaps with `historical`, any anomaly in that period is absorbed into the baseline — the detector learns to treat it as normal and misses it. Always slice so that `recent` starts where `historical` ends.
+
+```typescript
+import { predict } from 'volume-anomaly';
+import type { IAggregatedTradeData } from 'volume-anomaly';
+
+// Your data-fetching function — returns the last `limit` trades, oldest first:
+declare function getAggregatedTrades(
+  symbol: string,
+  limit:  number,
+): Promise<IAggregatedTradeData[]>;
+
+// ── One-shot (single API call, zero overlap) ──────────────────────────────────
+
+const N_train  = 1200;  // calibration window
+const N_detect = 200;   // window to evaluate
+
+const all        = await getAggregatedTrades('BTCUSDT', N_train + N_detect);
+const historical = all.slice(0, N_train);  // older 1200 trades — baseline
+const recent     = all.slice(N_train);     // newest 200 trades — no overlap
+
+const result = predict(historical, recent, 0.75);
+// {
+//   anomaly:    true,
+//   confidence: 0.83,
+//   direction:  'long',   // 'long' | 'short' | 'neutral'
+//   imbalance:  0.61,
+// }
+
+if (result.anomaly) {
+  console.log(`direction=${result.direction}  confidence=${result.confidence.toFixed(2)}`);
+}
+```
+
+`predict()` trains a fresh detector on every call. For continuous monitoring (many `detect()` calls from one trained model) use `VolumeAnomalyDetector` directly — see the class API below.
+
 ---
 
 ### `new VolumeAnomalyDetector(config?)`
