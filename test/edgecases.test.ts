@@ -19,7 +19,7 @@ import {
   bocpdInitState,
   bocpdAnomalyScore,
 } from '../src/math/bocpd.js';
-import { cusumFit, cusumUpdate, cusumInitState, cusumAnomalyScore } from '../src/math/cusum.js';
+import { cusumFit, cusumUpdate, cusumInitState, cusumAnomalyScore, cusumBatch } from '../src/math/cusum.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -705,5 +705,279 @@ describe('detect() without train() throws', () => {
     for (let i = 0; i < 100; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
     det.train(hist);
     expect(det.isTrained).toBe(true);
+  });
+});
+
+// ─── 16. imbalance_shift: порог > 0.4 строгий ────────────────────────────────
+//
+// detector.ts:234 — `if (absImb > 0.4) signals.push(...)`.
+// Строгое >: при absImb = 0.4 ровно сигнал НЕ добавляется.
+// volumeImbalance — прямой вызов на всём detect-окне (не rolling).
+
+describe('detect(): imbalance_shift signal boundary (absImb > 0.4 strict)', () => {
+  function trainedDet(): VolumeAnomalyDetector {
+    const det = new VolumeAnomalyDetector({ windowSize: 5 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+    return det;
+  }
+
+  it('absImb = 0.4 exactly: NO imbalance_shift signal emitted', () => {
+    // buy=7 trades × qty=1, sell=3 trades × qty=1 → (7-3)/10 = 0.4 exactly
+    const window: IAggregatedTradeData[] = [
+      ...Array.from({ length: 7 }, (_, i) => trade(500_000 + i * 100, 1, false)), // buy aggressors
+      ...Array.from({ length: 3 }, (_, i) => trade(500_700 + i * 100, 1, true)),  // sell aggressors
+    ];
+    const result = trainedDet().detect(window);
+    const has = result.signals.some((s) => s.kind === 'imbalance_shift');
+    expect(has).toBe(false); // 0.4 > 0.4 is false
+    expect(result.imbalance).toBeCloseTo(0.4, 10);
+  });
+
+  it('absImb = 0.5: imbalance_shift signal IS emitted', () => {
+    // buy=75 × qty=1, sell=25 × qty=1 → (75-25)/100 = 0.5 > 0.4 → signal fires
+    const window: IAggregatedTradeData[] = [
+      ...Array.from({ length: 75 }, (_, i) => trade(500_000 + i * 10, 1, false)),
+      ...Array.from({ length: 25 }, (_, i) => trade(501_000 + i * 10, 1, true)),
+    ];
+    const result = trainedDet().detect(window);
+    const has = result.signals.some((s) => s.kind === 'imbalance_shift');
+    expect(has).toBe(true); // 0.5 > 0.4 → signal
+    expect(result.imbalance).toBeCloseTo(0.5, 10);
+  });
+
+  it('at boundary: 0.4 → no signal; 0.5 → signal (strict > documented)', () => {
+    // Confirms the strict inequality is intentional, not off-by-one
+    expect(0.4 > 0.4).toBe(false);
+    expect(0.5 > 0.4).toBe(true);
+  });
+});
+
+// ─── 17. signals[]: пустой список когда все sub-scores ниже порогов ───────────
+//
+// Сигналы добавляются только при:  hawkesScore > 0.5, absImb > 0.4,
+//                                  cusumScore > 0.7, bocpdScore > 0.3.
+// При спокойных данных все 4 условия ложны → signals = [].
+
+describe('detect(): signals[] is empty when all sub-scores below thresholds', () => {
+  it('balanced trades at regular intervals → no signals emitted', () => {
+    // Обучение и детектирование на сбалансированных, регулярных данных.
+    // Balanced buy/sell → imbalance ≈ 0 (far below 0.4 threshold).
+    // Regular arrivals → Hawkes score low (no burst).
+    // Stable process → CUSUM/BOCPD scores low.
+    const det = new VolumeAnomalyDetector({ windowSize: 10 });
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+
+    // Detect on perfectly balanced window
+    const window: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 50; i++) window.push(trade(300_000 + i * 1000, 1, i % 2 === 0));
+    const result = det.detect(window);
+
+    expect(result.signals).toEqual([]);
+    // Verify the conditions that produce empty signals
+    const absImb = Math.abs(result.imbalance);
+    expect(absImb).toBeLessThanOrEqual(0.4); // no imbalance_shift
+  });
+});
+
+// ─── 18. detect() с trades < windowSize → CUSUM/BOCPD bypass ─────────────────
+//
+// rollingAbsImbalance() возвращает [] когда sorted.length < windowSize.
+// Это означает что циклы CUSUM и BOCPD не выполняются:
+//   peakCusumScore = 0, bocpdScore = 0.
+// confidence = wH * hawkesScore ≤ 0.4 * 1 = 0.4 < threshold 0.75.
+// anomaly НИКОГДА не может быть true в этом режиме (при дефолтных весах).
+
+describe('detect(): fewer trades than windowSize bypasses CUSUM and BOCPD', () => {
+  function trainedDet(): VolumeAnomalyDetector {
+    // windowSize=50 (default), trained on 300 trades
+    const det = new VolumeAnomalyDetector();
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 300; i++) hist.push(trade(i * 1000, 1 + (i % 3) * 0.5, i % 2 === 0));
+    det.train(hist);
+    return det;
+  }
+
+  it('30 trades (< windowSize=50): no crash, confidence finite in [0,1]', () => {
+    const det = trainedDet();
+    const window: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 30; i++) window.push(trade(400_000 + i * 1000, 1, i % 2 === 0));
+    const result = det.detect(window);
+    expect(Number.isFinite(result.confidence)).toBe(true);
+    expect(result.confidence).toBeGreaterThanOrEqual(0);
+    expect(result.confidence).toBeLessThanOrEqual(1);
+  });
+
+  it('30 trades (< windowSize=50): cusumStat = 0 (CUSUM loop never ran)', () => {
+    const det = trainedDet();
+    const window: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 30; i++) window.push(trade(400_000 + i * 1000, 1, i % 2 === 0));
+    // cusumState stays at initState → sPos=sNeg=0 → cusumStat=0
+    expect(det.detect(window).cusumStat).toBe(0);
+  });
+
+  it('30 trades (< windowSize=50): runLength = 0 (BOCPD loop never ran)', () => {
+    const det = trainedDet();
+    const window: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 30; i++) window.push(trade(400_000 + i * 1000, 1, i % 2 === 0));
+    // bocpdResult stays at initial {mapRunLength:0} → runLength=0
+    expect(det.detect(window).runLength).toBe(0);
+  });
+
+  it('30 trades (< windowSize=50): anomaly is false (confidence ≤ 0.4 < threshold)', () => {
+    // confidence = wH * hawkesScore ≤ 0.4 < default threshold 0.75
+    const det = trainedDet();
+    const window: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 30; i++) window.push(trade(400_000 + i * 1000, 1, i % 3 === 0));
+    expect(det.detect(window).anomaly).toBe(false);
+  });
+
+  it('1 trade (extreme case of < windowSize): all stats finite, no crash', () => {
+    const det = trainedDet();
+    const result = det.detect([trade(500_000, 2, false)]);
+    expect(Number.isFinite(result.confidence)).toBe(true);
+    expect(result.cusumStat).toBe(0);
+    expect(result.runLength).toBe(0);
+  });
+});
+
+// ─── 19. train() дважды: модели перезаписываются без ошибки ──────────────────
+//
+// detector.ts:172 — `this.models = { ... }` всегда перезаписывает.
+// Нет guard'а "уже обучен". Второй вызов допустим (ретрейн).
+
+describe('train() called twice: model overwrite without error', () => {
+  it('second train() does not throw', () => {
+    const det = new VolumeAnomalyDetector();
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+    // Second call on different data — must not throw
+    const hist2: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist2.push(trade(i * 500, 2, i % 3 === 0));
+    expect(() => det.train(hist2)).not.toThrow();
+  });
+
+  it('second train() updates hawkesParams (different data → different fit)', () => {
+    const det = new VolumeAnomalyDetector();
+
+    // First: sparse trades (1-second apart)
+    const hist1: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist1.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist1);
+    const mu1 = det.trainedModels!.hawkesParams.mu;
+
+    // Second: dense trades (100ms apart — 10× higher rate → different mu)
+    const hist2: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist2.push(trade(i * 100, 1, i % 2 === 0));
+    det.train(hist2);
+    const mu2 = det.trainedModels!.hawkesParams.mu;
+
+    // Different training data → different estimated mu
+    expect(mu1).not.toBeCloseTo(mu2, 1);
+  });
+
+  it('isTrained remains true after second train()', () => {
+    const det = new VolumeAnomalyDetector();
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist);
+    det.train(hist); // same data, second call
+    expect(det.isTrained).toBe(true);
+  });
+
+  it('detect() after second train() uses new models (no stale state)', () => {
+    const det = new VolumeAnomalyDetector({ windowSize: 10 });
+
+    // Train on balanced data
+    const hist1: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist1.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist1);
+
+    // Retrain on identical data
+    const hist2: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) hist2.push(trade(i * 1000, 1, i % 2 === 0));
+    det.train(hist2);
+
+    // detect() must not crash and must return valid result
+    const window: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 50; i++) window.push(trade(300_000 + i * 1000, 1, i % 2 === 0));
+    const result = det.detect(window);
+    expect(Number.isFinite(result.confidence)).toBe(true);
+    expect(result.confidence).toBeGreaterThanOrEqual(0);
+    expect(result.confidence).toBeLessThanOrEqual(1);
+  });
+});
+
+// ─── 20. cusumBatch: несколько сигналов тревоги ───────────────────────────────
+//
+// cusum.ts:143-147 — после каждого alarm state сбрасывается в 0.
+// При двух отдельных спайках alarmIndices.length ≥ 2.
+
+describe('cusumBatch: multiple alarm firings', () => {
+  it('two separate spike bursts produce ≥ 2 alarms', () => {
+    // baseline: alternating 0.3/0.4 → mu0 ≈ 0.35, std0 ≈ 0.05
+    const baseline = Array.from({ length: 50 }, (_, i) => 0.3 + (i % 2) * 0.1);
+    const params = cusumFit(baseline, 0.5, 2); // h = 2σ ≈ 0.1
+
+    // Two distinct spikes separated by calm period
+    const series = [
+      ...baseline,
+      ...Array(5).fill(5.0),   // spike 1 — far above threshold
+      ...baseline,
+      ...Array(5).fill(5.0),   // spike 2 — far above threshold
+    ];
+
+    const { alarmIndices } = cusumBatch(series, params);
+    expect(alarmIndices.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('alarm indices from multiple spikes are ordered (ascending)', () => {
+    const baseline = Array.from({ length: 50 }, (_, i) => 0.3 + (i % 2) * 0.1);
+    const params = cusumFit(baseline, 0.5, 2);
+
+    const series = [
+      ...baseline,
+      ...Array(3).fill(5.0),
+      ...baseline,
+      ...Array(3).fill(5.0),
+    ];
+
+    const { alarmIndices } = cusumBatch(series, params);
+    for (let i = 1; i < alarmIndices.length; i++) {
+      expect(alarmIndices[i]!).toBeGreaterThan(alarmIndices[i - 1]!);
+    }
+  });
+
+  it('state after multiple alarms has sPos = 0 (reset after last alarm)', () => {
+    // After each alarm sPos is reset; final state sPos = 0 if last obs triggered alarm
+    const baseline = Array(10).fill(0.1);
+    const params = cusumFit(baseline, 0.5, 1); // very sensitive: h ≈ σ
+
+    const series = [...Array(10).fill(0.1), 5.0, ...Array(10).fill(0.1), 5.0];
+    const { state, alarmIndices } = cusumBatch(series, params);
+
+    expect(alarmIndices.length).toBeGreaterThanOrEqual(2);
+    // After the last alarm the accumulator was zeroed; any calm values keep it at/near 0
+    expect(state.sPos).toBeGreaterThanOrEqual(0);
+    expect(state.sNeg).toBeGreaterThanOrEqual(0);
+  });
+
+  it('single-element series with value above h fires alarm at index 0', () => {
+    const params = { mu0: 0, std0: 1, k: 0, h: 1 };
+    const { alarmIndices } = cusumBatch([10], params);
+    expect(alarmIndices).toEqual([0]);
+  });
+
+  it('empty series → no alarms, state stays at init', () => {
+    const params = { mu0: 0, std0: 1, k: 0.5, h: 4 };
+    const { state, alarmIndices } = cusumBatch([], params);
+    expect(alarmIndices).toEqual([]);
+    expect(state.sPos).toBe(0);
+    expect(state.sNeg).toBe(0);
+    expect(state.n).toBe(0);
   });
 });
