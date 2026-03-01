@@ -40,12 +40,16 @@ export interface CusumParams {
  * values — e.g. array of |imbalance| from a calm training window.
  */
 export function cusumFit(values: number[], kSigmas = 0.5, hSigmas = 4): CusumParams {
-  if (values.length === 0) {
+  // Drop non-finite values (NaN, ±Infinity) before computing statistics.
+  // A single NaN in `values` would make mu0 = NaN, which later poisons the
+  // CUSUM accumulator even for valid observations (Math.max(0, x − NaN) = NaN).
+  const clean = values.filter(Number.isFinite);
+  if (clean.length === 0) {
     return { mu0: 0, std0: 1, k: kSigmas, h: hSigmas };
   }
-  const n    = values.length;
-  const mu0  = values.reduce((s, x) => s + x, 0) / n;
-  const var0 = values.reduce((s, x) => s + (x - mu0) ** 2, 0) / Math.max(n - 1, 1);
+  const n    = clean.length;
+  const mu0  = clean.reduce((s, x) => s + x, 0) / n;
+  const var0 = clean.reduce((s, x) => s + (x - mu0) ** 2, 0) / Math.max(n - 1, 1);
   const std0 = Math.sqrt(var0) || 1e-6;
   return {
     mu0,

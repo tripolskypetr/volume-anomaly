@@ -49,6 +49,10 @@ export function hawkesLogLikelihood(
   const { mu, alpha, beta } = params;
   const n = timestamps.length;
   if (n === 0) return 0;
+  // β ≤ 0: kernel exp(−β·dt) does not decay (diverges or flat).
+  // Compensator = (α/β)·(1−exp(−β·(T−tᵢ))) → Inf·0 = NaN when β=0.
+  // Return −Infinity so the optimizer treats this as an infeasible region.
+  if (beta <= 0) return -Infinity;
 
   // Use observation window length, not absolute time, so the LL is invariant
   // to timestamp origin (works for both t0=0 and Unix-epoch seconds).
