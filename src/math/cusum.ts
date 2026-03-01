@@ -89,6 +89,11 @@ export function cusumUpdate(
     return { alarm: false, preResetState: state, state };
   }
   const { mu0, k, h } = params;
+  // NaN in mu0 or k also poisons the accumulator (x − NaN = NaN).
+  // Treat corrupt params as a no-op, same semantics as x=NaN.
+  if (!Number.isFinite(mu0) || !Number.isFinite(k)) {
+    return { alarm: false, preResetState: state, state };
+  }
   const sPos  = Math.max(0, state.sPos + (x - mu0) - k);
   const sNeg  = Math.max(0, state.sNeg - (x - mu0) - k);
   const alarm = sPos >= h || sNeg >= h;
@@ -115,6 +120,9 @@ export function cusumInitState(): CusumState {
  */
 export function cusumAnomalyScore(state: CusumState, params: CusumParams): number {
   const s = Math.max(state.sPos, state.sNeg);
+  // Math.max(NaN, finite) = NaN in JS (unlike some other languages).
+  // A poisoned state must not propagate NaN to the confidence score.
+  if (Number.isNaN(s)) return 0;
   // NaN <= 0 is false in IEEE 754, so guard explicitly against non-finite h.
   if (params.h <= 0 || !Number.isFinite(params.h)) return 0;
   return Math.min(s / params.h, 1);

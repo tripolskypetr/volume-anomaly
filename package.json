@@ -1,7 +1,7 @@
 {
   "name": "volume-anomaly",
   "version": "1.0.0",
-  "description": "Statistical volume anomaly detection for trade streams — Hawkes process, CUSUM, and Bayesian Online Changepoint Detection (BOCPD). Zero dependencies. TypeScript.",
+  "description": "Statistical volume anomaly detection for trade streams - Hawkes process, CUSUM, and Bayesian Online Changepoint Detection (BOCPD). Zero dependencies. TypeScript.",
   "type": "module",
   "main": "./build/index.cjs",
   "module": "./build/index.mjs",

@@ -33,6 +33,14 @@ export function volumeImbalance(trades: IAggregatedTradeData[]): number {
   }
   const total = buyVol + sellVol;
   if (total === 0) return 0;
+  // When total = Infinity (an overflowed qty) the division (buyVol−sellVol)/Infinity
+  // is NaN even for a one-sided burst (Inf/Inf = NaN in IEEE 754).
+  // Compare sides directly to get the correct ±1 / 0 answer.
+  // NaN total (from NaN qty) falls through to the regular division — GIGO.
+  if (total === Infinity) {
+    if (buyVol === sellVol) return 0;   // both Infinity — symmetric burst
+    return buyVol > sellVol ? 1 : -1;
+  }
   return (buyVol - sellVol) / total;
 }
 
@@ -238,7 +246,9 @@ export function hawkesAnomalyScore(
 
   // meanLambda = 0 when mu = 0: ratio = peakLambda / 0 = Infinity (score=1) when
   // peakLambda > 0, or NaN (0/0) when peakLambda = 0.  Guard the NaN case.
-  const intensityScore = meanLambda > 0 ? sig(peakLambda / meanLambda)
+  // NaN peakLambda (e.g. timestamps contained NaN): treat as "no signal" → 0.
+  const intensityScore = meanLambda > 0
+    ? (Number.isNaN(peakLambda) ? 0 : sig(peakLambda / meanLambda))
     : peakLambda > 0 ? 1 : 0;
   const rateScore      = empiricalRate > 0
     ? (params.mu > 0 ? sig(empiricalRate / params.mu) : 1)
