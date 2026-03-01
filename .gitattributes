@@ -1,0 +1,1 @@
+mock/BTCUSDT-aggTrades-2025-03-01.csv filter=lfs diff=lfs merge=lfs -text
