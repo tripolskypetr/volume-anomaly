@@ -1,7 +1,18 @@
 {
   "name": "volume-anomaly",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Statistical volume anomaly detection for trade streams - Hawkes process, CUSUM, and Bayesian Online Changepoint Detection (BOCPD). Zero dependencies. TypeScript.",
+  "author": {
+    "name": "Petr Tripolsky",
+    "email": "tripolskypetr@gmail.com",
+    "url": "https://github.com/tripolskypetr"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "http://paypal.me/tripolskypetr"
+  },
+  "license": "MIT",
+  "homepage": "https://backtest-kit.github.io/documents/article_07_ai_news_trading_signals.html",
   "type": "module",
   "main": "./build/index.cjs",
   "module": "./build/index.mjs",
