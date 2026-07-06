@@ -62,12 +62,18 @@ export function detect(
  *
  * The directional threshold is derived automatically from training data:
  * `imbalanceThreshold = p75 of the rolling signed imbalance series` (configurable
- * via `DetectorConfig.imbalancePercentile`). Pass an explicit number to override.
+ * via `DetectorConfig.imbalancePercentile`), applied symmetrically: long above
+ * +threshold, short below −threshold.  The threshold is clamped at zero — on a
+ * sell-trended baseline the raw quantile goes negative, and an unclamped bound
+ * would label balanced (or even sell-side) flow as `'long'`: after the clamp
+ * `'long'` always implies imbalance > 0 and `'short'` implies imbalance < 0.
+ * Pass an explicit number to override.
  *
  * @param historical          Baseline window (≥ 50 trades) for model training.
  * @param recent              Recent window to evaluate.
  * @param confidence          Anomaly threshold [0,1]. Default 0.75.
- * @param imbalanceThreshold  Override the trained threshold. Omit to use p75 from training.
+ * @param imbalanceThreshold  Override the trained threshold (applied as
+ *                            symmetric ±max(0, thr)). Omit to use p75 from training.
  */
 export function predict(
   historical:          IAggregatedTradeData[],
@@ -78,7 +84,10 @@ export function predict(
   const detector = new VolumeAnomalyDetector();
   detector.train(historical);
   const r   = detector.detect(recent, confidence);
-  const thr = imbalanceThreshold ?? detector.trainedModels!.imbalanceThreshold;
+  const thr = Math.max(
+    0,
+    imbalanceThreshold ?? detector.trainedModels!.imbalanceThreshold,
+  );
 
   let direction: Direction = 'neutral';
   if (r.anomaly) {

@@ -70,7 +70,9 @@ export interface DetectorConfig {
    * Percentile (0–100) of the training rolling signed imbalance distribution
    * used as the directional threshold inside predict().
    * p75 means: direction=long only when imbalance exceeds the 75th percentile
-   * of the training imbalance series; direction=short when below the 25th.
+   * of the training imbalance series; direction=short when below its negation.
+   * The threshold is clamped at zero before use, so a trended baseline whose
+   * quantile crosses zero can never flip long/short semantics.
    * Default 75.
    */
   imbalancePercentile?: number;
@@ -93,7 +95,13 @@ interface TrainedModels {
   hawkesParams:        HawkesParams;
   cusumParams:         CusumParams;
   bocpdPrior:          NormalGammaPrior;
-  /** p(imbalancePercentile) of the training rolling signed imbalance series */
+  /**
+   * p(imbalancePercentile) of the training rolling signed imbalance series.
+   * predict() applies it as a symmetric ±threshold clamped at zero: on a
+   * sell-trended baseline the raw quantile goes negative, and an unclamped
+   * "imbalance > p75" fired 'long' on perfectly balanced flow while making
+   * 'neutral' unreachable.
+   */
   imbalanceThreshold:  number;
   /**
    * Self-calibrated ceilings measured on the training window.
@@ -153,6 +161,17 @@ function quantile(arr: number[], p: number): number {
 interface RobustStats {
   med: number;
   mad: number;
+}
+
+/**
+ * Math.max(...xs) without the spread: each spread element becomes a call
+ * argument, so a detection window of ~10⁶ trades overflows the call stack
+ * (RangeError) before any math runs.
+ */
+function arrayMax(xs: number[]): number {
+  let m = -Infinity;
+  for (const x of xs) if (x > m) m = x;
+  return m;
 }
 
 function robustStats(xs: number[]): RobustStats {
@@ -402,7 +421,8 @@ export class VolumeAnomalyDetector {
 
     // ── Directional threshold: p(imbalancePercentile) of rolling signed imbalance.
     // Uses signed (not absolute) series so trending markets produce an elevated
-    // threshold that reflects actual baseline buy/sell bias.
+    // threshold that reflects actual baseline buy/sell bias.  Applied by
+    // predict() as symmetric ±threshold clamped at zero (see TrainedModels).
     const imbalanceThreshold = signedImbalance.length > 0
       ? quantile(signedImbalance, this.cfg.imbalancePercentile)
       : 0.3;
@@ -482,10 +502,10 @@ export class VolumeAnomalyDetector {
     if (timestamps.length >= 2) {
       const fast = this.rollingRates(sorted, timestamps, fastHorizonSec);
       const slow = this.rollingRates(sorted, timestamps, slowHorizonSec);
-      zRate     = robustZ(Math.max(...fast.rates),    rateStats.fast);
-      zVol      = robustZ(Math.max(...fast.volRates), volStats.fast);
-      zRateSlow = robustZ(Math.max(...slow.rates),    rateStats.slow);
-      zVolSlow  = robustZ(Math.max(...slow.volRates), volStats.slow);
+      zRate     = robustZ(arrayMax(fast.rates),    rateStats.fast);
+      zVol      = robustZ(arrayMax(fast.volRates), volStats.fast);
+      zRateSlow = robustZ(arrayMax(slow.rates),    rateStats.slow);
+      zVolSlow  = robustZ(arrayMax(slow.volRates), volStats.slow);
     }
     // λ ratio (peak Hawkes intensity vs the training peak) is reported in
     // stats/meta for transparency but deliberately kept OUT of the score: it

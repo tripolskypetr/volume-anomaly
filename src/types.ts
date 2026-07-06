@@ -26,9 +26,14 @@ export interface PredictionResult {
   confidence: number;
   /**
    * Directional signal derived from imbalance:
-   * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression)
-   * - `'short'`   — anomaly + imbalance < −imbalanceThreshold (sell aggression)
+   * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression);
+   *                 always implies imbalance > 0
+   * - `'short'`   — anomaly + imbalance < −imbalanceThreshold (sell aggression);
+   *                 always implies imbalance < 0
    * - `'neutral'` — no anomaly, or anomaly with balanced order flow (rate-only spike)
+   *
+   * The threshold (trained p75 of rolling signed imbalance, or the explicit
+   * override) is clamped at zero before the symmetric ± comparison.
    */
   direction:  Direction;
   /** Signed imbalance [-1,+1]. Positive = buy-side pressure. */

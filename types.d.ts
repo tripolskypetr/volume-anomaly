@@ -20,9 +20,14 @@ interface PredictionResult {
     confidence: number;
     /**
      * Directional signal derived from imbalance:
-     * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression)
-     * - `'short'`   — anomaly + imbalance < −imbalanceThreshold (sell aggression)
+     * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression);
+     *                 always implies imbalance > 0
+     * - `'short'`   — anomaly + imbalance < −imbalanceThreshold (sell aggression);
+     *                 always implies imbalance < 0
      * - `'neutral'` — no anomaly, or anomaly with balanced order flow (rate-only spike)
+     *
+     * The threshold (trained p75 of rolling signed imbalance, or the explicit
+     * override) is clamped at zero before the symmetric ± comparison.
      */
     direction: Direction;
     /** Signed imbalance [-1,+1]. Positive = buy-side pressure. */
@@ -201,7 +206,9 @@ interface DetectorConfig {
      * Percentile (0–100) of the training rolling signed imbalance distribution
      * used as the directional threshold inside predict().
      * p75 means: direction=long only when imbalance exceeds the 75th percentile
-     * of the training imbalance series; direction=short when below the 25th.
+     * of the training imbalance series; direction=short when below its negation.
+     * The threshold is clamped at zero before use, so a trended baseline whose
+     * quantile crosses zero can never flip long/short semantics.
      * Default 75.
      */
     imbalancePercentile?: number;
@@ -210,7 +217,13 @@ interface TrainedModels {
     hawkesParams: HawkesParams;
     cusumParams: CusumParams;
     bocpdPrior: NormalGammaPrior;
-    /** p(imbalancePercentile) of the training rolling signed imbalance series */
+    /**
+     * p(imbalancePercentile) of the training rolling signed imbalance series.
+     * predict() applies it as a symmetric ±threshold clamped at zero: on a
+     * sell-trended baseline the raw quantile goes negative, and an unclamped
+     * "imbalance > p75" fired 'long' on perfectly balanced flow while making
+     * 'neutral' unreachable.
+     */
     imbalanceThreshold: number;
     /**
      * Self-calibrated ceilings measured on the training window.
@@ -399,12 +412,18 @@ declare function detect(historical: IAggregatedTradeData[], recent: IAggregatedT
  *
  * The directional threshold is derived automatically from training data:
  * `imbalanceThreshold = p75 of the rolling signed imbalance series` (configurable
- * via `DetectorConfig.imbalancePercentile`). Pass an explicit number to override.
+ * via `DetectorConfig.imbalancePercentile`), applied symmetrically: long above
+ * +threshold, short below −threshold.  The threshold is clamped at zero — on a
+ * sell-trended baseline the raw quantile goes negative, and an unclamped bound
+ * would label balanced (or even sell-side) flow as `'long'`: after the clamp
+ * `'long'` always implies imbalance > 0 and `'short'` implies imbalance < 0.
+ * Pass an explicit number to override.
  *
  * @param historical          Baseline window (≥ 50 trades) for model training.
  * @param recent              Recent window to evaluate.
  * @param confidence          Anomaly threshold [0,1]. Default 0.75.
- * @param imbalanceThreshold  Override the trained threshold. Omit to use p75 from training.
+ * @param imbalanceThreshold  Override the trained threshold (applied as
+ *                            symmetric ±max(0, thr)). Omit to use p75 from training.
  */
 declare function predict(historical: IAggregatedTradeData[], recent: IAggregatedTradeData[], confidence?: number, imbalanceThreshold?: number): PredictionResult;
 

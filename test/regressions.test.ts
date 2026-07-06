@@ -15,10 +15,16 @@
  *     of a long run (50 → 0).
  *  6. cusum_alarm signal meta reports the peak pre-reset accumulators, not the
  *     post-reset zeros.
+ *  7. predict() direction on trended baselines: the signed-p75 threshold turns
+ *     negative on sell-heavy training data, and the unclamped symmetric ±thr
+ *     comparison then labelled balanced flow (imbalance ≈ 0) as 'long' while
+ *     making 'neutral' unreachable.  The threshold is now clamped at zero.
+ *  8. detect() on very large windows: Math.max(...rates) spread overflowed the
+ *     call stack (RangeError) at ~10⁶ trades.
  */
 
 import { describe, it, expect } from 'vitest';
-import { VolumeAnomalyDetector } from '../src/index.js';
+import { VolumeAnomalyDetector, predict } from '../src/index.js';
 import type { IAggregatedTradeData } from '../src/index.js';
 import { cusumFit, bocpdAnomalyScore, bocpdInitState } from '../src/math/index.js';
 
@@ -195,4 +201,106 @@ describe('cusum_alarm meta reflects the pre-reset peak', () => {
     const peak = Math.max(alarm!.meta['sPos']!, alarm!.meta['sNeg']!);
     expect(peak).toBeGreaterThanOrEqual(0.7 * alarm!.meta['h']!);
   });
+});
+
+// ─── 7. predict() direction on trended baselines ──────────────────────────────
+
+describe('predict() direction: sell-biased training does not flip long/short', () => {
+  /** n trades, `buyEveryN` of them buy-aggressor — e.g. 100/7 ≈ 14% buys */
+  function makeBiased(n: number, startTs: number, buyEveryN: number): IAggregatedTradeData[] {
+    const trades: IAggregatedTradeData[] = [];
+    for (let i = 0; i < n; i++) {
+      trades.push(makeTrade(startTs + i * 1000, 1, i % buyEveryN !== 0)); // isBuyerMaker=true → sell
+    }
+    return trades;
+  }
+
+  it('sell-heavy baseline → trained threshold quantile is negative', () => {
+    const det = new VolumeAnomalyDetector();
+    det.train(makeBiased(500, 0, 7)); // ~86% sell aggressors
+    // Precondition of the bug: signed p75 goes below zero on sell-biased data.
+    expect(det.trainedModels!.imbalanceThreshold).toBeLessThan(0);
+  });
+
+  it('balanced recent flow after sell-heavy training is not "long"', () => {
+    const hist = makeBiased(500, 0, 7);
+    const rec  = makeCalm(100, 600_000, 1000); // alternating buy/sell → imbalance = 0
+    // confidence 0 → anomaly always true, isolating the direction logic.
+    const r = predict(hist, rec, 0.0);
+    expect(r.imbalance).toBeCloseTo(0, 6);
+    // Before the fix: imbalance (0) > negative p75 → 'long' on balanced flow.
+    expect(r.direction).toBe('neutral');
+  });
+
+  it('sell burst after sell-heavy training is still "short"', () => {
+    const hist = makeBiased(500, 0, 7);
+    const rec: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 100; i++) {
+      rec.push(makeTrade(600_000 + i * 1000, 1, true)); // all sells → imbalance = −1
+    }
+    const r = predict(hist, rec, 0.0);
+    expect(r.imbalance).toBe(-1);
+    expect(r.direction).toBe('short');
+  });
+
+  it('buy burst after buy-heavy training is still "long"', () => {
+    const hist: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 500; i++) {
+      hist.push(makeTrade(i * 1000, 1, i % 7 === 0)); // ~86% buy aggressors
+    }
+    const rec: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 100; i++) {
+      rec.push(makeTrade(600_000 + i * 1000, 1, false)); // all buys → imbalance = +1
+    }
+    const r = predict(hist, rec, 0.0);
+    expect(r.imbalance).toBe(1);
+    expect(r.direction).toBe('long');
+  });
+
+  it('direction always matches the imbalance sign', () => {
+    // Property pinned by the clamp: 'long' ⇒ imbalance > 0, 'short' ⇒ < 0.
+    const histories = [
+      makeBiased(500, 0, 7),          // sell-heavy
+      makeBiased(500, 0, 2),          // balanced
+      makeCalm(500, 0, 1000),         // alternating
+    ];
+    const recents = [
+      makeCalm(100, 600_000, 1000),                                                // imb 0
+      Array.from({ length: 100 }, (_, i) => makeTrade(600_000 + i * 1000, 1, true)),  // imb −1
+      Array.from({ length: 100 }, (_, i) => makeTrade(600_000 + i * 1000, 1, false)), // imb +1
+    ];
+    for (const hist of histories) {
+      for (const rec of recents) {
+        const r = predict(hist, rec, 0.0);
+        if (r.direction === 'long')  expect(r.imbalance).toBeGreaterThan(0);
+        if (r.direction === 'short') expect(r.imbalance).toBeLessThan(0);
+      }
+    }
+  });
+
+  it('negative explicit override is clamped, not flipped', () => {
+    const hist = makeCalm(500, 0, 1000);
+    const rec  = makeCalm(100, 600_000, 1000); // imbalance = 0
+    const r = predict(hist, rec, 0.0, -0.5);
+    // Before the clamp: 0 > −0.5 → 'long' on perfectly balanced flow.
+    expect(r.direction).toBe('neutral');
+  });
+});
+
+// ─── 8. detect() on very large windows ────────────────────────────────────────
+
+describe('detect() with ~10⁶ trades does not overflow the call stack', () => {
+  it('1M-trade window: no RangeError from Math.max spread', () => {
+    const detector = new VolumeAnomalyDetector();
+    detector.train(makeCalm(300, 0, 500));
+
+    const big: IAggregatedTradeData[] = new Array(1_000_000);
+    for (let i = 0; i < big.length; i++) {
+      big[i] = makeTrade(400_000 + i * 100, 1, i % 2 === 0);
+    }
+    // Before the fix this threw "RangeError: Maximum call stack size exceeded"
+    // inside detect() before any scoring ran.
+    const result = detector.detect(big, 0.75);
+    expect(Number.isFinite(result.confidence)).toBe(true);
+  }, 60_000);
 });
