@@ -399,18 +399,21 @@ declare class VolumeAnomalyDetector {
     private readonly explicitSlow;
     constructor(config?: DetectorConfig);
     /**
-     * trades[].timestamp must be Unix MILLISECONDS.  A wrong unit never crashes —
-     * it silently rescales every time horizon 1000× (the most damaging
-     * integration mistake possible) — so the two real-world mix-ups are rejected
-     * here.  Only epoch-like values can be judged; relative/synthetic timestamps
-     * pass through untouched:
+     * trades[].timestamp must be FINITE Unix MILLISECONDS.  A wrong unit never
+     * crashes — it silently rescales every time horizon 1000× (the most
+     * damaging integration mistake possible) — and a single out-of-unit or
+     * non-finite timestamp inflates the training span, which downstream sizes
+     * loops and allocations.  Both ENDS of the sorted window are checked, so a
+     * µs/seconds tail mixed into otherwise-valid data is caught, not just a bad
+     * first element.  Only epoch-like values can be unit-judged;
+     * relative/synthetic timestamps pass through untouched:
      *   epoch seconds → [1e9, 4e9) covers years 2001–2096, where this mistake
      *     actually lives; as relative ms that's a 12–46 day origin — narrow
      *     enough not to collide with synthetic data (kept deliberately tighter
      *     than the full seconds range so arbitrary synthetic origins < 1e9 pass);
      *   epoch µs      → ≥ 1e14; as ms that's year 5138+, colliding with nothing.
      */
-    private static assertMillis;
+    private static assertTimestamps;
     /**
      * Fit all models to historical (in-control) trade data.
      * Must be called before detect().

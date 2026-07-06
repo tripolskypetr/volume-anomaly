@@ -340,6 +340,20 @@ const CALIB_FALLBACK_VOL:  ChannelCalib = { c: 6.5, u: 5.5, nullQ: [] };
  */
 const NONCANONICAL_FLOOR_MULT = 1.15;
 
+/**
+ * Hard bound on the null-calibration histogram size (calibrateChannel).
+ * The bucket count is DATA-derived (training span / step), so without a
+ * bound a pathological span — e.g. two datasets years apart concatenated
+ * with explicitly pinned horizons, or a corrupt timestamp inside the valid
+ * millisecond band — turns the dense bucket array into a multi-gigabyte
+ * allocation and an O(span/step) loop: an effective hang.  1e6 buckets is
+ * 8 MB and ~16e6 loop steps (instant), and at the default 1.875 s step it
+ * covers a 3-week baseline — far beyond any meaningful training span.
+ * Anything larger cannot be calibrated sensibly; fall back to the universal
+ * mapping instead of allocating.
+ */
+const MAX_CALIB_BUCKETS = 1_000_000;
+
 // ─── Serialization ────────────────────────────────────────────────────────────
 
 /**
@@ -453,27 +467,35 @@ export class VolumeAnomalyDetector {
   }
 
   /**
-   * trades[].timestamp must be Unix MILLISECONDS.  A wrong unit never crashes —
-   * it silently rescales every time horizon 1000× (the most damaging
-   * integration mistake possible) — so the two real-world mix-ups are rejected
-   * here.  Only epoch-like values can be judged; relative/synthetic timestamps
-   * pass through untouched:
+   * trades[].timestamp must be FINITE Unix MILLISECONDS.  A wrong unit never
+   * crashes — it silently rescales every time horizon 1000× (the most
+   * damaging integration mistake possible) — and a single out-of-unit or
+   * non-finite timestamp inflates the training span, which downstream sizes
+   * loops and allocations.  Both ENDS of the sorted window are checked, so a
+   * µs/seconds tail mixed into otherwise-valid data is caught, not just a bad
+   * first element.  Only epoch-like values can be unit-judged;
+   * relative/synthetic timestamps pass through untouched:
    *   epoch seconds → [1e9, 4e9) covers years 2001–2096, where this mistake
    *     actually lives; as relative ms that's a 12–46 day origin — narrow
    *     enough not to collide with synthetic data (kept deliberately tighter
    *     than the full seconds range so arbitrary synthetic origins < 1e9 pass);
    *   epoch µs      → ≥ 1e14; as ms that's year 5138+, colliding with nothing.
    */
-  private static assertMillis(t0: number): void {
-    if (t0 >= 1e9 && t0 < 4e9) {
-      throw new Error(
-        `timestamps look like Unix SECONDS (first = ${t0}); timestamp must be in milliseconds`,
-      );
-    }
-    if (t0 >= 1e14) {
-      throw new Error(
-        `timestamps look like Unix MICROseconds (first = ${t0}); timestamp must be in milliseconds`,
-      );
+  private static assertTimestamps(tFirst: number, tLast: number): void {
+    for (const t of [tFirst, tLast]) {
+      if (!Number.isFinite(t)) {
+        throw new Error(`timestamps must be finite numbers, got ${t}`);
+      }
+      if (t >= 1e9 && t < 4e9) {
+        throw new Error(
+          `timestamps look like Unix SECONDS (${t}); timestamp must be in milliseconds`,
+        );
+      }
+      if (t >= 1e14) {
+        throw new Error(
+          `timestamps look like Unix MICROseconds (${t}); timestamp must be in milliseconds`,
+        );
+      }
     }
   }
 
@@ -487,10 +509,22 @@ export class VolumeAnomalyDetector {
     if (trades.length < 50) {
       throw new Error(`Need at least 50 trades for training, got ${trades.length}`);
     }
+    // Full finiteness scan (train only — one O(n) pass vs the fitting cost):
+    // a NaN timestamp in the MIDDLE survives sorting at either end and would
+    // poison gaps/horizons.  detect() keeps the ends-only check: all its
+    // loops and allocations are bounded by the input length, so a mid-stream
+    // NaN degrades that one result but cannot hang or over-allocate.
+    for (const t of trades) {
+      if (!Number.isFinite(t.timestamp)) {
+        throw new Error(`timestamps must be finite numbers, got ${t.timestamp}`);
+      }
+    }
 
     // Sort by time
     const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
-    VolumeAnomalyDetector.assertMillis(sorted[0]!.timestamp);
+    VolumeAnomalyDetector.assertTimestamps(
+      sorted[0]!.timestamp, sorted[sorted.length - 1]!.timestamp,
+    );
 
     // ── Self-calibrated rate baselines: robust median/MAD of the rolling
     // arrival rate (events/s) and rolling volume rate (qty/s) at both time
@@ -710,7 +744,9 @@ export class VolumeAnomalyDetector {
     }
 
     const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
-    VolumeAnomalyDetector.assertMillis(sorted[0]!.timestamp);
+    VolumeAnomalyDetector.assertTimestamps(
+      sorted[0]!.timestamp, sorted[sorted.length - 1]!.timestamp,
+    );
     const {
       hawkesParams, cusumParams, bocpdPrior,
       rateStats, volStats, horizonsSec, slowHorizonSec, channelCalib,
@@ -1055,7 +1091,9 @@ export class VolumeAnomalyDetector {
     const step = windowSec / SUB;
     const t0   = sampleTs[0]!;
     const nBuckets = Math.floor((sampleTs[sampleTs.length - 1]! - t0) / step) + 1;
-    if (nBuckets < 2 * SUB) return fallback;
+    if (!Number.isFinite(nBuckets) || nBuckets < 2 * SUB || nBuckets > MAX_CALIB_BUCKETS) {
+      return fallback;
+    }
 
     // Max per step-bucket, then sliding window max = max of SUB consecutive
     // buckets at every bucket offset (window length stays exactly windowSec).

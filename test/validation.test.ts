@@ -114,6 +114,61 @@ describe('train()/detect(): timestamp unit sanity check', () => {
     const det = new VolumeAnomalyDetector();
     expect(() => det.train(makeStream(200, 2_500_000_000_000, 1000))).not.toThrow();
   });
+
+  it('microsecond TAIL in otherwise-valid ms data is rejected (both ends checked)', () => {
+    // First timestamp valid ms, last in µs: previously only the first element
+    // was unit-checked, so the µs tail slipped through and inflated the span
+    // (which downstream sizes loops and allocations).
+    const trades = makeStream(200, EPOCH_MS, 1000);
+    trades[trades.length - 1] = { ...trades[trades.length - 1]!, timestamp: EPOCH_US };
+    const det = new VolumeAnomalyDetector();
+    expect(() => det.train(trades)).toThrow(/MICRO/);
+  });
+
+  it('NaN / Infinity timestamps are rejected in train (anywhere in the stream)', () => {
+    const det = new VolumeAnomalyDetector();
+    const mid = makeStream(200, 0, 1000);
+    mid[100] = { ...mid[100]!, timestamp: NaN };  // middle: survives sorting at either end
+    expect(() => det.train(mid)).toThrow(/finite/);
+    const inf = makeStream(200, 0, 1000);
+    inf[199] = { ...inf[199]!, timestamp: Infinity };
+    expect(() => det.train(inf)).toThrow(/finite/);
+  });
+
+  it('detect() rejects non-finite window ends', () => {
+    const det = new VolumeAnomalyDetector();
+    det.train(makeStream(200, 0, 1000));
+    const rec = makeStream(50, 300_000, 1000);
+    rec[49] = { ...rec[49]!, timestamp: NaN };
+    // NaN sorts unpredictably but the ends check catches boundary corruption
+    expect(() => det.detect([{ ...rec[0]!, timestamp: NaN }])).toThrow(/finite/);
+  });
+});
+
+// ─── 4. Data-derived allocations are bounded (no hang on pathological spans) ──
+
+describe('train(): pathological spans cannot hang the null calibration', () => {
+  it('two clusters YEARS apart with pinned horizons train instantly via fallback', () => {
+    // All timestamps sit in the valid ms band, but the span is ~9.5 years.
+    // With explicitly pinned horizons (auto-horizons scale with the span and
+    // self-protect; pinned ones do not) the null-calibration histogram would
+    // be span/step ≈ 1.6e8 buckets — a multi-GB allocation and an effective
+    // hang before the MAX_CALIB_BUCKETS bound.
+    const trades: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 100; i++) {
+      trades.push({ id: String(i), price: 100, qty: 1, timestamp: 1_700_000_000_000 + i * 1000, isBuyerMaker: i % 2 === 0 });
+    }
+    for (let i = 0; i < 100; i++) {
+      trades.push({ id: `b${i}`, price: 100, qty: 1, timestamp: 2_000_000_000_000 + i * 1000, isBuyerMaker: i % 2 === 0 });
+    }
+    const det = new VolumeAnomalyDetector({ rateHorizonSec: 5, slowHorizonSec: 30 });
+    const t0 = performance.now();
+    det.train(trades);
+    expect(performance.now() - t0).toBeLessThan(5000);
+    // The calibration must have fallen back to the universal mapping
+    // (empty null ladder) rather than allocating the histogram.
+    expect(det.trainedModels!.channelCalib.rate[0]!.nullQ.length).toBe(0);
+  });
 });
 
 // ─── 3. detect() confidence range ─────────────────────────────────────────────
