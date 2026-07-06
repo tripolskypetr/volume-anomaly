@@ -230,7 +230,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
     };
 
     // Per-bucket predictive join: detector confidence vs forward response.
-    const pred: Array<{ b: number; lab: Label; conf: number; anomaly: boolean; ret: number }> = [];
+    const pred: Array<{ b: number; lab: Label; conf: number; anomaly: boolean; ret: number; move: number }> = [];
 
     const started = Date.now();
     // Progress bar: one line per ~5% of the day (vitest streams stdout live,
@@ -283,6 +283,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
       branchings.push(m.hawkesParams.alpha / m.hawkesParams.beta);
 
       let r = det.detect(makeWindow(c, Math.max(fi, end - RECENT_MAX), end), CONF);
+      let move = r.moveScore; // peak predictive ranking score over calls
       let rr = 0, vr = 0; // peak fast-horizon robust z over calls (rate, vol)
       const calls: Array<{ s: number; z: number[] }> = [];
       for (let e = Math.min(fi + RECENT_MAX, end); ; e += 150) {
@@ -290,6 +291,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         const start = Math.max(fi, e - RECENT_MAX);
         const rc = det.detect(makeWindow(c, start, e), CONF);
         if (rc.confidence > r.confidence) r = rc;
+        if (rc.moveScore > move) move = rc.moveScore;
         rr = Math.max(rr, rc.stats.zRate, rc.stats.zRateSlow);
         vr = Math.max(vr, rc.stats.zVol,  rc.stats.zVolSlow);
         const spanSec = (c.ts[e - 1]! - c.ts[start]!) / 1000;
@@ -312,7 +314,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         rat.vol.push(vr);
       }
       const retBps = close[b]! > 0 && open[b]! > 0 ? Math.abs(Math.log(close[b]! / open[b]!)) * 1e4 : 0;
-      pred.push({ b, lab, conf: r.confidence, anomaly: r.anomaly, ret: retBps });
+      pred.push({ b, lab, conf: r.confidence, anomaly: r.anomaly, ret: retBps, move });
       rows.push({
         b, lab,
         h: r.scores.hawkes, c: r.scores.cusum, p: r.scores.bocpd,
@@ -413,6 +415,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         const moved  = zs.map((z) => z >= THR);
         const nMoved = moved.filter(Boolean).length;
         const aucConf = auc(rowsOk.map((p) => p.conf), moved);
+        const aucMove = auc(rowsOk.map((p) => p.move), moved);
         const aucGt   = auc(rowsOk.map((p) => Math.max(zVol[p.b]!, zCnt[p.b]!)), moved);
         const aucRet  = auc(rowsOk.map((p) => p.ret), moved);
         let movedAndFlagged = 0, flagged = 0;
@@ -423,7 +426,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         console.log(
           `fwd ${horizon} z≥${THR}: base rate ${(100 * nMoved / zs.length).toFixed(1)}%  ` +
           `P(move|anomaly)=${(100 * pMovedGivenAnomaly).toFixed(1)}%  ` +
-          `AUC conf=${aucConf.toFixed(3)}  AUC gtZ=${aucGt.toFixed(3)}  AUC |ret|=${aucRet.toFixed(3)}`,
+          `AUC conf=${aucConf.toFixed(3)}  AUC moveScore=${aucMove.toFixed(3)}  AUC gtZ=${aucGt.toFixed(3)}  AUC |ret|=${aucRet.toFixed(3)}`,
         );
       }
     }

@@ -107,5 +107,6 @@ export function predict(
     direction,
     imbalance:      r.imbalance,
     burstImbalance: r.burstImbalance,
+    moveScore:      r.moveScore,
   };
 }

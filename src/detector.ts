@@ -719,6 +719,7 @@ export class VolumeAnomalyDetector {
 
     let zRate = 0, zVol = 0, zRateSlow = 0, zVolSlow = 0;
     let hawkesScore = 0;
+    let moveScore = 0, zVolLong = -Infinity;
     // Peak burst window of the winning channel: trade index of the rolling
     // window END whose statistic won the score, plus that channel's horizon.
     let peakIdx = -1, peakHorizonSec = 0;
@@ -769,6 +770,26 @@ export class VolumeAnomalyDetector {
         ? Math.max(tLead, (tLead + Math.max(Number.isFinite(tOther) ? tOther : 0, 0)) / Math.SQRT2)
         : -Infinity;
       hawkesScore = Number.isFinite(combined) ? ratSig(combined) : 0;
+
+      // ── Predictive ranking score (moveScore).
+      // Confidence answers "is this an anomaly?" and is optimized for the
+      // detection frontier; for ranking FORWARD price response it is
+      // handicapped by design — per-baseline adaptive levels re-zero the
+      // scale every training window, and the fast channels are ranking
+      // noise.  Measured on the full-day benchmark (forward 1-min range z):
+      // long-scale VOLUME z ranks at AUC ≈ 0.64 vs ≈ 0.60 for confidence
+      // (naive momentum 0.57); adding rate corroboration or fast scales
+      // only degrades it.  So moveScore = the peak volume z at the slow and
+      // longer scales, through the FIXED universal mapping (vol floor 6.5,
+      // tail unit 5.5) with no baseline adaptation and no span shift —
+      // comparable across windows and across time by construction.
+      // It is a ranking strength, not a detection threshold.
+      for (let k = Math.max(iSlow, 0); k < zVols.length; k++) {
+        if (zVols[k]! > zVolLong) zVolLong = zVols[k]!;
+      }
+      moveScore = Number.isFinite(zVolLong)
+        ? ratSig((zVolLong - CALIB_FALLBACK_VOL.c) / CALIB_FALLBACK_VOL.u)
+        : 0;
     }
     // λ ratio (peak Hawkes intensity vs the training peak) is reported in
     // stats/meta for transparency but deliberately kept OUT of the score: it
@@ -896,6 +917,7 @@ export class VolumeAnomalyDetector {
       signals,
       imbalance,
       burstImbalance,
+      moveScore,
       peakTs,
       hawkesLambda: lambda,
       cusumStat:    Math.max(cusumState.sPos, cusumState.sNeg),
@@ -1084,6 +1106,7 @@ export class VolumeAnomalyDetector {
       signals:      [],
       imbalance:    0,
       burstImbalance: 0,
+      moveScore:    0,
       peakTs:       0,
       hawkesLambda: 0,
       cusumStat:    0,

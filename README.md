@@ -98,6 +98,7 @@ const result = predict(historical, recent, 0.75, 0.3);
 //   direction:      'long',    // 'long' | 'short' | 'neutral'
 //   imbalance:      0.42,      // full-window flow balance
 //   burstImbalance: 0.72,      // flow balance INSIDE the peak burst window
+//   moveScore:      0.68,      // predictive ranking score for forward price response
 // }
 ```
 
@@ -134,8 +135,11 @@ interface PredictionResult {
   direction:      Direction;  // 'long' | 'short' | 'neutral'
   imbalance:      number;     // full-window buy/sell balance [-1, +1]
   burstImbalance: number;     // buy/sell balance inside the peak burst window
+  moveScore:      number;     // predictive ranking score [0,1) — see below
 }
 ```
+
+**`moveScore` — ranking alerts by expected follow-through.** `confidence` answers "is this an anomaly?" and is optimized for the detection frontier; for ranking which alerts precede actual price movement it is handicapped by design (per-baseline adaptive levels re-zero the scale each training window, and fast channels are ranking noise). `moveScore` is the peak **long-scale volume z** through a *fixed* universal mapping — no baseline adaptation, comparable across windows and across time. Measured on the full-day benchmark: ranks the forward 1-minute price range at AUC ≈ 0.64 vs ≈ 0.60 for `confidence` (naive momentum ≈ 0.57). Use it to prioritize or size — never as the detection threshold.
 
 **Practical usage with `getAggregatedTrades` from `backtest-kit`:**
 

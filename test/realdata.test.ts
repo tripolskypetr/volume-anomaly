@@ -206,6 +206,35 @@ describe('realdata: VolumeAnomalyDetector on BTCUSDT-2025-03-01', () => {
     det.train(spike1.historical);
     expect(det.isTrained).toBe(true);
   });
+
+  // ── moveScore: predictive ranking strength ──────────────────────────────────
+
+  it('moveScore ranks volume spikes above the calm window', () => {
+    // moveScore = long-scale volume z through a FIXED mapping (no baseline
+    // adaptation) — its whole purpose is cross-window comparability, so the
+    // volume-driven spikes must outrank the calm window on it.
+    const score = (w: MockWindow) => {
+      const det = new VolumeAnomalyDetector();
+      det.train(w.historical);
+      return det.detect(w.recent, 0.75).moveScore;
+    };
+    const calmScore = score(calm);
+    for (const w of [spike1, spike2, spike4]) {
+      expect(score(w)).toBeGreaterThan(calmScore);
+    }
+    expect(calmScore).toBeLessThan(0.5); // calm sits below the z=6.5 anchor
+  });
+
+  it('moveScore is in [0,1) and finite on all fixtures', () => {
+    for (const w of [spike1, spike2, spike3, spike4, calm]) {
+      const det = new VolumeAnomalyDetector();
+      det.train(w.historical);
+      const m = det.detect(w.recent, 0.75).moveScore;
+      expect(Number.isFinite(m)).toBe(true);
+      expect(m).toBeGreaterThanOrEqual(0);
+      expect(m).toBeLessThan(1);
+    }
+  });
 });
 
 // ─── predict() on real data ────────────────────────────────────────────────────
