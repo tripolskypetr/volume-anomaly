@@ -366,12 +366,15 @@ export class VolumeAnomalyDetector {
    * it silently rescales every time horizon 1000× (the most damaging
    * integration mistake possible) — so the two real-world mix-ups are rejected
    * here.  Only epoch-like values can be judged; relative/synthetic timestamps
-   * (small values) pass through untouched:
-   *   epoch seconds  ~1.7e9  → falls in [1e8, 1e11)   (as ms: early 1970s)
-   *   epoch µs       ~1.7e15 → exceeds 1e14           (as ms: year 5138+)
+   * pass through untouched:
+   *   epoch seconds → [1e9, 4e9) covers years 2001–2096, where this mistake
+   *     actually lives; as relative ms that's a 12–46 day origin — narrow
+   *     enough not to collide with synthetic data (kept deliberately tighter
+   *     than the full seconds range so arbitrary synthetic origins < 1e9 pass);
+   *   epoch µs      → ≥ 1e14; as ms that's year 5138+, colliding with nothing.
    */
   private static assertMillis(t0: number): void {
-    if (t0 >= 1e8 && t0 < 1e11) {
+    if (t0 >= 1e9 && t0 < 4e9) {
       throw new Error(
         `timestamps look like Unix SECONDS (first = ${t0}); timestamp must be in milliseconds`,
       );

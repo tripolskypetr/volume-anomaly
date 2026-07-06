@@ -208,7 +208,26 @@ const { hawkesParams, cusumParams, bocpdPrior } = detector.trainedModels!;
 | `cusumKSigmas` | `number` | `0.5` | CUSUM allowable slack k in σ units. Controls sensitivity: lower k = faster response but more false positives |
 | `cusumHSigmas` | `number` | `5` | CUSUM alarm threshold floor in σ units; the effective `h` is self-calibrated as `max(hSigmas·σ, 2 × max training excursion)` because the rolling series is heavily autocorrelated |
 | `scoreWeights` | `[n, n, n]` | `[1, 0, 0]` | Weights for [volume channel, CUSUM, BOCPD]. Must sum to 1. The default gives the flow-shift detectors zero weight — on real data they dilute volume-anomaly recall (see `test/eval.test.ts`); their scores remain available in `result.scores` |
-| `imbalancePercentile` | `number` | `75` | Percentile of the training rolling signed imbalance used as the directional threshold. p75 = direction fires only when imbalance exceeds the 75th percentile of the training distribution |
+| `imbalancePercentile` | `number` | `75` | Percentile of the training rolling signed imbalance used as the directional threshold. p75 = direction fires only when imbalance exceeds the 75th percentile of the training distribution. Clamped at zero before use, so `'long'` always implies imbalance > 0 and `'short'` implies imbalance < 0 |
+
+Every numeric option is validated at construction — a bad value (e.g. `hazardLambda: 0.5`, which would silently collapse the BOCPD state, or a non-integer `windowSize`) throws immediately with the option name and received value instead of producing a miscalibrated detector. Two input mistakes that never crash but silently rescale every time horizon 1000× are also rejected: timestamps that look like Unix **seconds** or **microseconds** (they must be milliseconds), and a percent-style `confidence` (`75` instead of `0.75`).
+
+### `toJSON()` / `VolumeAnomalyDetector.fromJSON(snapshot)`
+
+Trained models are plain finite numbers, so a detector serializes losslessly: train once (e.g. in a worker on a schedule), ship the snapshot anywhere, and detect without re-training.
+
+```typescript
+const detector = new VolumeAnomalyDetector();
+detector.train(historicalTrades);
+
+const snapshot = JSON.stringify(detector);          // uses toJSON() automatically
+
+// … elsewhere (another process, a file, Redis, …):
+const restored = VolumeAnomalyDetector.fromJSON(snapshot); // string or parsed object
+const result   = restored.detect(recentTrades, 0.75);      // identical to the original
+```
+
+`fromJSON` validates the snapshot structurally — config re-passes constructor validation, and every numeric leaf of the models must be finite (JSON silently turns `NaN`/`Infinity` into `null`, so a corrupted snapshot fails loudly here, with the offending path in the message, rather than as `NaN` confidence inside `detect()`). Auto-chosen horizons stay auto after restore: a restored detector re-derives them if you call `train()` again.
 
 ---
 

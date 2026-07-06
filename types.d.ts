@@ -306,6 +306,21 @@ interface ChannelCalib {
      */
     nullQ: number[];
 }
+/**
+ * JSON-friendly snapshot of a detector: configuration + trained models.
+ * Produced by toJSON() (and therefore by JSON.stringify(detector)); consumed
+ * by VolumeAnomalyDetector.fromJSON().  Every value is a plain finite number
+ * or boolean, so the snapshot survives a JSON round-trip losslessly.
+ */
+interface DetectorSnapshot {
+    /** Snapshot format version; current writers emit 1 */
+    version: number;
+    config: Required<DetectorConfig>;
+    /** Whether the fast/slow horizons were pinned explicitly (vs auto-chosen) */
+    explicitFast: boolean;
+    explicitSlow: boolean;
+    models: TrainedModels | null;
+}
 declare class VolumeAnomalyDetector {
     private readonly cfg;
     private models;
@@ -313,6 +328,19 @@ declare class VolumeAnomalyDetector {
     private readonly explicitFast;
     private readonly explicitSlow;
     constructor(config?: DetectorConfig);
+    /**
+     * trades[].timestamp must be Unix MILLISECONDS.  A wrong unit never crashes —
+     * it silently rescales every time horizon 1000× (the most damaging
+     * integration mistake possible) — so the two real-world mix-ups are rejected
+     * here.  Only epoch-like values can be judged; relative/synthetic timestamps
+     * pass through untouched:
+     *   epoch seconds → [1e9, 4e9) covers years 2001–2096, where this mistake
+     *     actually lives; as relative ms that's a 12–46 day origin — narrow
+     *     enough not to collide with synthetic data (kept deliberately tighter
+     *     than the full seconds range so arbitrary synthetic origins < 1e9 pass);
+     *   epoch µs      → ≥ 1e14; as ms that's year 5138+, colliding with nothing.
+     */
+    private static assertMillis;
     /**
      * Fit all models to historical (in-control) trade data.
      * Must be called before detect().
@@ -369,6 +397,21 @@ declare class VolumeAnomalyDetector {
     private rollingAbsImbalance;
     private rollingSignedImbalance;
     private emptyResult;
+    /**
+     * Snapshot of configuration + trained models (deep-copied — mutating the
+     * result cannot poison the detector).  Called automatically by
+     * JSON.stringify(detector).  Restore with VolumeAnomalyDetector.fromJSON():
+     * train once (e.g. in a worker on a schedule), serialize, detect anywhere
+     * else without re-training.
+     */
+    toJSON(): DetectorSnapshot;
+    /**
+     * Reconstruct a detector from a toJSON() snapshot (object or JSON string).
+     * The snapshot is validated structurally — config through the constructor,
+     * models leaf-by-leaf — so corrupted or hand-edited state fails loudly here
+     * rather than as NaN confidence inside detect().
+     */
+    static fromJSON(snapshot: DetectorSnapshot | string): VolumeAnomalyDetector;
     get isTrained(): boolean;
     /** Expose fitted parameters (for debugging / serialization) */
     get trainedModels(): Readonly<TrainedModels> | null;
@@ -428,4 +471,4 @@ declare function detect(historical: IAggregatedTradeData[], recent: IAggregatedT
 declare function predict(historical: IAggregatedTradeData[], recent: IAggregatedTradeData[], confidence?: number, imbalanceThreshold?: number): PredictionResult;
 
 export { VolumeAnomalyDetector, detect, predict };
-export type { AnomalyKind, AnomalySignal, DetectionResult, DetectorConfig, Direction, IAggregatedTradeData, PredictionResult };
+export type { AnomalyKind, AnomalySignal, DetectionResult, DetectorConfig, DetectorSnapshot, Direction, IAggregatedTradeData, PredictionResult, TrainedModels };
