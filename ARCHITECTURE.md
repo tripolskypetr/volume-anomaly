@@ -14,7 +14,7 @@ Designed to work alongside the `garch` library (garch → price corridors, this 
 ### Public API (src/index.ts → src/detector.ts)
 - `detect(historical, recent, confidence?)` — one-shot functional API
 - `VolumeAnomalyDetector` class — stateful, train once, detect many times
-- Config: windowSize, hazardLambda, cusumKSigmas, cusumHSigmas, scoreWeights
+- Config: windowSize, rateHorizonSec, slowHorizonSec, hazardLambda, cusumKSigmas, cusumHSigmas, scoreWeights
 
 ### Math modules (src/math/)
 - `hawkes.ts` — Hawkes process (μ, α, β), MLE via Nelder-Mead, O(n) log-likelihood
@@ -27,18 +27,39 @@ Designed to work alongside the `garch` library (garch → price corridors, this 
 isBuyerMaker=true → sell aggressor; false → buy aggressor
 
 ### Output: DetectionResult
-{ anomaly, confidence[0,1], signals[], imbalance[-1,+1], hawkesLambda, cusumStat, runLength }
+{ anomaly, confidence[0,1], scores{hawkes,cusum,bocpd}, stats{zRate,zVol,zRateSlow,zVolSlow,lambdaRatio},
+  signals[], imbalance[-1,+1], hawkesLambda, cusumStat, runLength }
 
-## Score composition
-confidence = 0.4·hawkes + 0.3·cusum + 0.3·bocpd  (defaults)
-anomaly = confidence >= threshold (default 0.75)
-No single detector can exceed threshold alone at defaults.
+## Score composition (recalibrated on real data, July 2026)
+Primary statistic: self-calibrated robust z of rolling rate (trades/s) and
+volume rate (qty/s) over TIME horizons 5 s and 30 s.
+z = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median)).
+score_volume = max over 4 channels of sigmoid((z − 12)·0.4).
+confidence = 1.0·score_volume + 0·cusum + 0·bocpd  (defaults [1,0,0])
+anomaly = confidence >= threshold (default 0.75 ⇒ fires at z ≈ 14.7).
 
-## Tests (vitest, 68 tests, 4 files) — ALL PASSING
-- test/hawkes.test.ts — 20 tests
-- test/cusum.test.ts — 15 tests
-- test/bocpd.test.ts — 13 tests
-- test/detector.test.ts — 20 tests
+CUSUM/BOCPD (on rolling |imbalance|) are flow-shift detectors: computed,
+self-calibrated (CUSUM h = max(5σ, 2× training excursion); BOCPD rescaled
+above the training noise floor) and reported, but zero-weighted by default —
+on the real-data benchmark any additive weight on them reduced recall and
+added false alarms.
+
+Training contract: historical must span 15–30 MINUTES of market time (not
+"last N trades" — a count-based baseline masks the burst it precedes).
+Internally: rate baselines use the full span (O(n)); Hawkes MLE capped to the
+last 2000 trades; imbalance series to the last 1000.
+
+## Real-data benchmark (test/eval.test.ts, EVAL=1)
+Full day BTCUSDT 2025-03-01 (1.49M trades), 30s buckets, ground truth =
+robust z ≥ 8 vs trailing hour; sliding-window operational protocol.
+At confidence 0.75: bucket recall 90.3%, event recall 93.5%, FP 2.49%.
+The eval test asserts recall ≥ 0.75 / event recall ≥ 0.8 / FP ≤ 0.05 as a
+regression gate — if a change trips it, fix the change, not the thresholds.
+
+## Tests (vitest, ~750 tests, 19 files) — ALL PASSING
+Math units, detector integration, seeded scenarios, false-positive suite,
+adversarial/extreme inputs, real-data fixtures (mock/*.json, 15-min baselines),
+perf bounds, and the opt-in full-day eval sweep (EVAL=1).
 
 ## Build
 - TypeScript + Rollup (rollup.config.js)

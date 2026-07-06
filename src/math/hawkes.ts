@@ -224,8 +224,16 @@ export function hawkesPeakLambda(
  *     assigns alpha ≈ 0 (Poisson baseline), where the intensity ratio stays
  *     near 1 regardless of how many events arrived.
  *
- * Both ratios are fed through the same sigmoid centred at 2× baseline, so
- * the score is 0 at baseline rate, 0.5 at 2×, and approaches 1 at ≥ 4×.
+ * Both ratios are fed through the same sigmoid centred at 2× baseline:
+ * score ≈ 0.12 at baseline rate (1×), 0.5 at 2×, and approaches 1 at ≥ 4×.
+ * Note the ≈ 0.12 floor at baseline — the score never reaches exactly 0.
+ *
+ * NOTE: these THEORETICAL baselines (E[λ], μ) are adequate for near-Poisson
+ * synthetic data only.  On real trade streams rates fluctuate several-fold
+ * between adjacent windows of a perfectly normal market, so "2× the fitted μ"
+ * is routine noise — VolumeAnomalyDetector does not use this function; it
+ * scores robust z of rolling rates against baselines measured on the training
+ * window instead.
  *
  * @param peakLambda    Peak λ(tᵢ) over the detection window (from hawkesPeakLambda).
  * @param params        Fitted Hawkes parameters.
@@ -237,12 +245,12 @@ export function hawkesAnomalyScore(
   params: HawkesParams,
   empiricalRate = 0,
 ): number {
+  // sigmoid centred at 2× baseline
+  const sig = (ratio: number) => 1 / (1 + Math.exp(-(ratio - 2) * 2));
+
   const branching  = params.alpha / params.beta;
   if (branching >= 1) return 1; // supercritical → always anomalous
   const meanLambda = params.mu / (1 - branching);
-
-  // sigmoid centred at 2× baseline
-  const sig = (ratio: number) => 1 / (1 + Math.exp(-(ratio - 2) * 2));
 
   // meanLambda = 0 when mu = 0: ratio = peakLambda / 0 = Infinity (score=1) when
   // peakLambda > 0, or NaN (0/0) when peakLambda = 0.  Guard the NaN case.

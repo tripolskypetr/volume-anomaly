@@ -16,9 +16,11 @@ npm install volume-anomaly
 
 ## Overview
 
-The library detects **abnormal surges in trade flow** — sudden acceleration of arrivals, buy/sell imbalance shifts, and structural regime changes — from a raw stream of aggregated trades. The direction of the trade must come from your own analysis (fundamental, technical). This library answers a narrower question: **is right now a statistically unusual moment in market microstructure?**
+The library detects **abnormal surges in trade flow** — sudden acceleration of arrivals and volume waves — from a raw stream of aggregated trades. The direction of the trade must come from your own analysis (fundamental, technical). This library answers a narrower question: **is right now a statistically unusual moment in market microstructure?**
 
-Three independent detectors run in parallel. Each produces a score in [0, 1]. The scores are combined into a single `confidence` value that you compare against your threshold.
+The primary statistic is a **self-calibrated robust z-score of trade rate and volume rate**: the detector measures "trades per 5 s / per 30 s" and "quantity per 5 s / per 30 s" in the detection window and scores the peaks against the median/MAD of the same statistic over the training window — *how many robust σ above the recent typical level*. Thresholds are calibrated on a full day of real BTCUSDT aggTrades (1.49 M trades, see `test/eval.test.ts`): at the default `confidence = 0.75` the detector catches ≈ 90 % of locally-strong volume anomalies (robust z ≥ 8 vs the trailing hour) with ≈ 2.5 % false alarms on normal 30-second windows.
+
+Two secondary detectors (CUSUM and BOCPD on order-flow imbalance) are computed and reported in `scores`/`signals`, but by default carry **zero weight** in the combined confidence: on real data they track flow-regime shifts — a different phenomenon — and any additive weight on them measurably dilutes recall. Re-weight via `scoreWeights` if your use case targets flow shifts specifically.
 
 ---
 
@@ -32,21 +34,24 @@ One-shot convenience function. Trains on historical data, then evaluates the rec
 import { detect } from 'volume-anomaly';
 import type { IAggregatedTradeData } from 'volume-anomaly';
 
-const historical: IAggregatedTradeData[] = await getAggregatedTrades('BTCUSDT', 2000);
+// historical: 15–30 MINUTES of trades (time span matters more than count —
+// the baseline must cover enough market time to define "typical")
+const historical: IAggregatedTradeData[] = await getAggregatedTrades('BTCUSDT', 10_000);
 const recent:     IAggregatedTradeData[] = await getAggregatedTrades('BTCUSDT', 300);
 
 const result = detect(historical, recent, 0.75);
 // {
 //   anomaly:      true,
-//   confidence:   0.81,          // weighted composite score
+//   confidence:   0.98,          // combined score (volume channel by default)
+//   scores:       { hawkes: 0.98, cusum: 0.61, bocpd: 0.00 },  // raw sub-scores
+//   stats:        { zRate: 22.3, zVol: 104.1, zRateSlow: 25.3, zVolSlow: 87.2, lambdaRatio: 3.1 },
 //   imbalance:    0.72,          // buy-side dominance
-//   hawkesLambda: 4.3,           // current intensity (trades/sec)
-//   cusumStat:    3.1,           // CUSUM accumulator (σ units)
+//   hawkesLambda: 61.8,          // peak intensity (trades/sec)
+//   cusumStat:    3.1,           // CUSUM accumulator
 //   runLength:    2,             // periods since last changepoint
 //   signals: [
-//     { kind: 'volume_spike',   score: 0.88, meta: { lambda: 4.3, mu: 1.1, branching: 0.61 } },
+//     { kind: 'volume_spike',    score: 0.98, meta: { lambda: 61.8, zRate: 22.3, zVol: 104.1, ... } },
 //     { kind: 'imbalance_shift', score: 0.72, meta: { imbalance: 0.72, absImbalance: 0.72 } },
-//     { kind: 'bocpd_changepoint', score: 0.44, meta: { cpProbability: 0.088, runLength: 2 } },
 //   ]
 // }
 ```
@@ -55,8 +60,8 @@ const result = detect(historical, recent, 0.75);
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `historical` | `IAggregatedTradeData[]` | required | Baseline window for training (≥ 50 trades). Should represent calm, in-control market conditions |
-| `recent` | `IAggregatedTradeData[]` | required | Window to evaluate. Typically 100–500 trades |
+| `historical` | `IAggregatedTradeData[]` | required | Baseline window for training. **Must span 15–30 minutes of market time** (code minimum: 50 trades). A count-based baseline ("last 500 trades") adapts its duration to market pace and masks the very burst being detected |
+| `recent` | `IAggregatedTradeData[]` | required | Window to evaluate. Typically 100–500 trades; must span at least `rateHorizonSec` (5 s) for the fast channel to engage |
 | `confidence` | `number` | `0.75` | Threshold in (0, 1). `result.anomaly = result.confidence >= confidence` |
 
 **Returns:** `DetectionResult`
@@ -65,6 +70,10 @@ const result = detect(historical, recent, 0.75);
 interface DetectionResult {
   anomaly:      boolean;       // confidence >= threshold
   confidence:   number;        // composite score [0,1]
+  scores:       { hawkes: number; cusum: number; bocpd: number }; // raw sub-scores
+  stats:        { zRate: number; zVol: number;                    // robust z of peak
+                  zRateSlow: number; zVolSlow: number;            // rolling rates
+                  lambdaRatio: number };                          // peak λ vs training
   signals:      AnomalySignal[]; // which sub-detectors fired
   imbalance:    number;        // buy/sell balance [-1, +1]
   hawkesLambda: number;        // conditional intensity at last trade (trades/sec)
@@ -172,11 +181,13 @@ Stateful class. Use when you need to re-use fitted models across multiple `detec
 import { VolumeAnomalyDetector } from 'volume-anomaly';
 
 const detector = new VolumeAnomalyDetector({
-  windowSize:   50,          // trades per imbalance window
-  hazardLambda: 200,         // expected periods between changepoints
-  cusumKSigmas: 0.5,         // CUSUM slack k = 0.5 · σ
-  cusumHSigmas: 5,           // CUSUM alarm h = 5 · σ
-  scoreWeights: [0.4, 0.3, 0.3], // [Hawkes, CUSUM, BOCPD]
+  windowSize:     50,        // trades per imbalance window (CUSUM/BOCPD)
+  rateHorizonSec: 5,         // fast rate/volume horizon (seconds)
+  slowHorizonSec: 30,        // slow rate/volume horizon (seconds)
+  hazardLambda:   200,       // expected periods between changepoints
+  cusumKSigmas:   0.5,       // CUSUM slack k = 0.5 · σ
+  cusumHSigmas:   5,         // CUSUM alarm h floor = 5 · σ
+  scoreWeights:   [1, 0, 0], // [volume channel, CUSUM, BOCPD]
 });
 
 detector.train(historicalTrades);
@@ -190,11 +201,13 @@ const { hawkesParams, cusumParams, bocpdPrior } = detector.trainedModels!;
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `windowSize` | `number` | `50` | Number of trades per rolling imbalance window. Smaller = more reactive to local shifts, larger = smoother signal |
+| `windowSize` | `number` | `50` | Number of trades per rolling imbalance window (CUSUM/BOCPD). Smaller = more reactive to local shifts, larger = smoother signal |
+| `rateHorizonSec` | `number` | `5` | Fast time horizon for the volume channel: "trades per 5 s" / "qty per 5 s". Catches brief intense bursts |
+| `slowHorizonSec` | `number` | `30` | Slow horizon for the same statistic. Catches sustained volume waves spread too evenly to concentrate at the fast horizon |
 | `hazardLambda` | `number` | `200` | Expected number of windows between changepoints (BOCPD hazard rate H = 1/λ). Set lower for more frequent regime changes |
 | `cusumKSigmas` | `number` | `0.5` | CUSUM allowable slack k in σ units. Controls sensitivity: lower k = faster response but more false positives |
-| `cusumHSigmas` | `number` | `5` | CUSUM alarm threshold h in σ units. Higher h = fewer but more confident alarms (ARL₀ ≈ 148 at h = 5σ) |
-| `scoreWeights` | `[n, n, n]` | `[0.4, 0.3, 0.3]` | Weights for [Hawkes, CUSUM, BOCPD] scores. Must sum to 1 |
+| `cusumHSigmas` | `number` | `5` | CUSUM alarm threshold floor in σ units; the effective `h` is self-calibrated as `max(hSigmas·σ, 2 × max training excursion)` because the rolling series is heavily autocorrelated |
+| `scoreWeights` | `[n, n, n]` | `[1, 0, 0]` | Weights for [volume channel, CUSUM, BOCPD]. Must sum to 1. The default gives the flow-shift detectors zero weight — on real data they dilute volume-anomaly recall (see `test/eval.test.ts`); their scores remain available in `result.scores` |
 | `imbalancePercentile` | `number` | `75` | Percentile of the training rolling signed imbalance used as the directional threshold. p75 = direction fires only when imbalance exceeds the 75th percentile of the training distribution |
 
 ---
@@ -205,26 +218,25 @@ const { hawkesParams, cusumParams, bocpdPrior } = detector.trainedModels!;
 
 In `garch`, `confidence` is a two-sided probability passed through `probit` to get a z-score, which then scales a log-normal price corridor: `confidence → z = probit((1+confidence)/2) → P·exp(±z·σ)`. The `confidence` there controls **band width**, not a classification threshold.
 
-Here, `confidence` is a **hard threshold on a composite score**. It has no probabilistic interpretation from a normal distribution. The formula is:
+Here, `confidence` is a **hard threshold on a composite score**. The formula is:
 
 ```
-score_final = w_H · score_hawkes + w_C · score_cusum + w_B · score_bocpd
+score_final = w_H · score_volume + w_C · score_cusum + w_B · score_bocpd
+            = score_volume                                    (default weights [1,0,0])
 anomaly     = score_final >= confidence
 ```
 
-Each sub-score is mapped independently to [0, 1] through its own non-linear function (sigmoid for Hawkes, linear ratio for CUSUM, amplified probability for BOCPD). The `confidence` you pass is the minimum weighted average you require before calling the moment an anomaly.
+The volume-channel score is a sigmoid over the peak robust z of the rolling rate/volume statistics: `score = σ((z − 12) · 0.4)`, so `confidence` maps directly to a z-level: 0.5 ⇒ z ≈ 12, 0.75 ⇒ z ≈ 14.7, 0.9 ⇒ z ≈ 17.5. The mapping is calibrated on a full day of real BTCUSDT trades (`test/eval.test.ts`).
 
-**Practical guidance:**
+**Practical guidance** (measured on the real-data benchmark, 30 s buckets):
 
-| `confidence` | Sensitivity | False positive rate | Use case |
-|-------------|-------------|---------------------|----------|
-| `0.5` | Very high | High | Research / signal exploration |
-| `0.65` | High | Moderate | Aggressive entries, many signals |
-| `0.75` (default) | Balanced | Low | Standard trading use |
-| `0.85` | Low | Very low | High-conviction entries only |
-| `0.95` | Very low | Near zero | Stress testing / rare events |
+| `confidence` | Fires at | Recall (strong anomalies) | False alarms (normal buckets) |
+|-------------|----------|---------------------------|-------------------------------|
+| `0.5` | z ≈ 12 | ≈ 92 % | ≈ 6.7 % |
+| `0.75` (default) | z ≈ 14.7 | ≈ 90 % | ≈ 2.5 % |
+| `0.9` | z ≈ 17.5 | ≈ 84 % | ≈ 1.5 % |
 
-Unlike `garch`, raising `confidence` does not widen a corridor — it raises the bar for all three detectors simultaneously. A result with `confidence = 0.74` at a threshold of `0.75` means the moment is borderline: borderline intense arrival rate, borderline imbalance shift, or borderline regime change — but not all three firing hard.
+A result with `confidence = 0.74` at a threshold of `0.75` means the moment is borderline — the peak rate/volume sits just under ~15 robust σ above the recent typical level.
 
 ---
 
@@ -336,30 +348,35 @@ peakLambda = max over i of λ(tᵢ)
 
 This ensures that a burst occurring in the middle of the window is detected even after the kernel has decayed by the last event.
 
-**Anomaly score — two signals combined via max:**
+**How the detector actually scores (self-calibrated z-channels):**
+
+The theoretical baselines above (`E[λ]`, fitted `μ`) are exported in the math API
+(`hawkesAnomalyScore`) but are **not what `VolumeAnomalyDetector` uses** — on real
+trade streams rates fluctuate several-fold between adjacent windows of a
+perfectly normal market, so "2× the fitted μ" is routine noise (measured: 28 %
+false alarms on real BTCUSDT).  Instead the detector scores robust z of rolling
+rate and volume-rate statistics against baselines measured on the training
+window itself:
 
 ```
-meanLambda   = μ / (1 − α/β)
-empiricalRate = n / windowDuration          (events/sec in detection window)
+for horizon h ∈ { rateHorizonSec (5 s), slowHorizonSec (30 s) }:
+  rate_i    = trades in (tᵢ − h, tᵢ] / h        (one sample per trade)
+  volRate_i = qty    in (tᵢ − h, tᵢ] / h
 
-sig(ratio) = 1 / (1 + exp(−(ratio − 2) · 2))
+  z = (max over detection window − median over training) /
+      (1.4826 · max(MAD_training, 0.1 · median))
 
-intensityScore = sig(peakLambda / meanLambda)
-rateScore      = sig(empiricalRate / μ)      (0 if empiricalRate not provided)
-
-score_hawkes = max(intensityScore, rateScore)
+score_volume = max over 4 channels of  σ((z − 12) · 0.4)
 ```
 
-The sigmoid is centred at `ratio = 2` (twice the baseline), so:
-- ratio = 1 (baseline rate) → score ≈ 0.018
-- ratio = 2 (2× baseline) → score = 0.50
-- ratio = 3 (3× baseline) → score ≈ 0.88
+The fitted Hawkes model still provides `hawkesLambda` / `lambdaRatio`
+diagnostics (peak conditional intensity vs the training peak), reported in
+`result.stats` and signal meta for transparency.
 
-Two complementary signals are combined with `max()`: **intensity ratio** captures self-excitation bursts when the fitted branching ratio is significant; **empirical rate ratio** fires even when MLE assigns α ≈ 0 (Poisson baseline) — a 1000× arrival surge is clearly anomalous regardless of the branching structure.
-
-If the fitted branching ratio `α/β ≥ 1`, the process is supercritical and the score is clamped to `1` unconditionally.
-
-**What the Hawkes score captures:** arrival rate acceleration. A flash crash preceded by 10× normal trade frequency will drive a high Hawkes score even before price moves significantly. It is blind to the *direction* of trades — only their timing.
+**What the volume channel captures:** arrival-rate acceleration (many trades
+per second) *and* volume waves (few huge trades) at both brief and sustained
+horizons. It is blind to the *direction* of trades — direction comes from
+`imbalance`.
 
 ---
 
@@ -500,41 +517,36 @@ The sigmoid is centred at `drop = 0.5` with steepness 8. The score is taken as t
 
 ### Composite Score and Signal Thresholds
 
-The three scores are linearly combined:
+The volume channel is the score that matters by default:
 
 ```
-confidence_score = w_H · score_hawkes + w_C · score_cusum + w_B · score_bocpd
-                 = 0.4 · score_hawkes + 0.3 · score_cusum + 0.3 · score_bocpd  (defaults)
+score_volume = max over channels of  σ((z − 12) · 0.4)
+  channels:  z of peak "trades per rateHorizonSec"   (fast arrival bursts)
+             z of peak "qty per rateHorizonSec"      (fast volume bursts, block trades)
+             z of peak "trades per slowHorizonSec"   (sustained arrival waves)
+             z of peak "qty per slowHorizonSec"      (sustained volume waves)
+
+  z = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median_train))
+
+confidence_score = w_H · score_volume + w_C · score_cusum + w_B · score_bocpd
+                 = score_volume                          (default weights [1, 0, 0])
+anomaly          = confidence_score >= confidence_threshold
 ```
 
-The `anomaly` flag is:
-
-```
-anomaly = confidence_score >= confidence_threshold
-```
+All four channels are **self-calibrated**: the yardstick is measured on the training window itself, so the same code adapts to any instrument's activity level. There are no theoretical thresholds ("2× the fitted μ", "5σ under i.i.d.") — those were tested on real data and misfire badly (28 % false alarms), because real trade streams are heavily autocorrelated and heavy-tailed.
 
 **Signals** are individual detector firings appended to `result.signals` when:
 
 | Signal kind | Fires when | Score attached |
 |-------------|-----------|----------------|
-| `volume_spike` | `score_hawkes > 0.5` | Hawkes max(intensityScore, rateScore) |
+| `volume_spike` | `score_volume > 0.5` | max of the four z-channel sigmoids |
 | `imbalance_shift` | `\|imbalance\| > 0.4` | Raw absolute imbalance |
-| `cusum_alarm` | `score_cusum > 0.7` | Linear ratio max(S⁺, S⁻) / h |
-| `bocpd_changepoint` | `score_bocpd > 0.3` | Sigmoid of relative run-length drop |
+| `cusum_alarm` | `score_cusum > 0.7` | Linear ratio max(S⁺, S⁻) / h (h self-calibrated) |
+| `bocpd_changepoint` | `score_bocpd > 0.3` | Run-length-drop score above the training noise floor |
 
-A signal in `result.signals` does **not** require `result.anomaly = true`. You can have partial signals (e.g. only Hawkes firing) with `confidence_score < threshold`. The signals let you understand *why* the composite score is what it is.
+A signal in `result.signals` does **not** require `result.anomaly = true`. Signals (and the raw `result.scores` / `result.stats`) let you understand *why* the composite score is what it is.
 
-**Score combination example** with defaults `[0.4, 0.3, 0.3]`:
-
-| scenario | Hawkes | CUSUM | BOCPD | composite | anomaly at 0.75 |
-|----------|--------|-------|-------|-----------|-----------------|
-| quiet market | 0.02 | 0.05 | 0.03 | 0.033 | ✗ |
-| arrival spike only | 0.90 | 0.10 | 0.05 | 0.39 | ✗ |
-| spike + imbalance | 0.90 | 0.75 | 0.20 | 0.645 | ✗ |
-| all three fire | 0.90 | 0.90 | 0.90 | 0.90 | ✓ |
-| CUSUM + BOCPD, calm arrivals | 0.15 | 0.95 | 0.95 | 0.63 | ✗ |
-
-This shows a key design property: **no single detector can exceed the threshold alone at default weights**, since max single contribution is `0.4 · 1.0 = 0.40`. At least two detectors must agree. Raise Hawkes weight to `0.8` if you want arrival rate alone to be sufficient.
+**Design property:** at default weights the anomaly decision is purely "is the trade rate or volume rate many robust σ above what this instrument did in the last 15–30 minutes". CUSUM/BOCPD track order-flow *imbalance* regime shifts — a different phenomenon that correlates poorly with volume anomalies on real data (measured: any additive weight on them reduces recall and adds false alarms). Give them weight only if flow shifts are what you actually want to detect.
 
 ---
 
@@ -619,34 +631,30 @@ BOCPD update is technically O(r_max) where r_max is the number of surviving run-
 
 ### `train()` — historical window
 
-The rolling imbalance series used to calibrate CUSUM and BOCPD has length `max(0, N − windowSize + 1)`. Too few trades → empty or near-empty calibration series → CUSUM baseline is a fallback (μ₀ = 0, σ₀ = 1) and Hawkes MLE is unreliable.
+**The time span matters more than the trade count.** The volume-channel baselines (median/MAD of rolling rates) are meaningful only if the training window covers enough market time to define "typical":
 
-| Trades in `historical` | Rolling windows for calibration¹ | Hawkes MLE | Notes |
-|------------------------|----------------------------------|------------|-------|
-| < 50 | — | — | **Rejected — `train()` throws** |
-| 50–99 | 1–50 | Borderline | CUSUM/BOCPD barely calibrated; Hawkes fallback path active (< 10 events triggers flat Poisson) |
-| 100–199 | 51–150 | Adequate | Practical minimum; mean/σ estimates reasonable |
-| 200–499 | 151–450 | Good | Stable MLE; recommended baseline for liquid pairs |
-| 500–2000 | 451–1951 | Robust | Best calibration; use for low-activity or volatile pairs |
-| > 2000 | > 1951 | Robust | Beware regime staleness — window may span multiple market conditions |
+| `historical` spans | Volume-channel baselines | Notes |
+|--------------------|--------------------------|-------|
+| < 1 minute | Unreliable | The slow horizon (30 s) has almost no independent samples; a hot pre-burst minute masks the burst itself |
+| 1–5 minutes | Weak | Usable for the fast horizon only |
+| **15–30 minutes** | **Good** | **Recommended.** This is what the calibration in `test/eval.test.ts` uses |
+| Multiple hours | Robust but stale | Beware regime staleness — baselines may span very different market conditions |
 
-¹ Assumes default `windowSize = 50`.
+Never build the baseline as "the last N trades": a count-based window adapts its *duration* to market pace — right before a burst it covers seconds of already-hot market and the inflated baseline masks the very anomaly being detected, while in a calm period it covers narrow minutes and routine wiggles look anomalous. Feed a **fixed time span** of recent history instead (internally the expensive fits are capped: Hawkes MLE uses the most recent 2 000 trades, the imbalance series the most recent 1 000; the O(n) rate baselines use everything).
 
-The training window should represent **normal, in-control market conditions**. Fitting on data that already contains anomalies will inflate the baseline and reduce sensitivity. If your market opens with a gap or major event, use a calmer historical window from the previous session.
+`train()` throws below 50 trades. The training window should represent **normal market conditions**: an anomaly inside the baseline inflates the yardstick and reduces sensitivity to similar events.
 
 ### `detect()` — recent window
 
-The same rolling logic applies: CUSUM and BOCPD only receive data when `trades ≥ windowSize`. Below that threshold only the Hawkes score contributes, and maximum confidence is `0.4 × hawkesScore ≤ 0.40` — the anomaly flag **cannot fire** at the default threshold of 0.75.
+The volume channel needs the recent window to span at least `rateHorizonSec` (5 s default) — shorter windows fall back to a single whole-window rate sample. CUSUM/BOCPD additionally need `trades ≥ windowSize` for their rolling imbalance series; when the window is shorter, score weights are renormalized over the detectors that actually ran, so the volume channel can still reach confidence 1 alone.
 
-| Trades in `recent` | Rolling windows¹ | All three detectors active | Notes |
-|--------------------|-----------------|---------------------------|-------|
-| < `windowSize` (< 50) | 0 | **No** | Hawkes-only; `anomaly` cannot fire at default threshold |
-| = `windowSize` (= 50) | 1 | Barely | Minimum for full detection; CUSUM/BOCPD signal is very sparse |
-| 2× `windowSize` (100) | 51 | Yes | **Recommended minimum** for production use |
-| 4× `windowSize` (200) | 151 | Yes | Good — default in code examples |
-| 10× `windowSize` (500) | 451 | Yes | Best accuracy; higher latency |
+| Trades in `recent` | Notes |
+|--------------------|-------|
+| < 5 s of market time | Fast channel falls back to whole-window rate; slow channel off |
+| 100–300 trades | **Recommended** — what the real-data calibration uses |
+| 300–1000 trades | Fine; peak-based statistics don't dilute with window growth |
 
-**Rule of thumb:** `recent ≥ 2 × windowSize`. On BTC/USDT perpetual (windowSize = 50), 200 trades typically spans 5–30 seconds and is comfortably available from a real-time buffer.
+**Rule of thumb:** call `detect()` every few seconds with the last ~300 trades; re-`train()` every few minutes with the trailing 15–30 minutes.
 
 ### `windowSize` guidance
 

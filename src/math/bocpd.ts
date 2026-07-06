@@ -218,17 +218,23 @@ export function bocpdUpdate(
  * data-driven posterior.  The real signal is the MAP run length: in a stable
  * process it grows step-by-step; a changepoint resets it to near 0.
  *
- * This function scores the *relative drop* from the previous step:
+ * This function scores the *relative drop* from the previous step, shrunk by
+ * how established the previous run was:
  *
- *   drop = clamp((prevRunLength − mapRunLength) / prevRunLength, 0, 1)
+ *   rawDrop = clamp((prevRunLength − mapRunLength) / prevRunLength, 0, 1)
+ *   drop    = rawDrop · prevRunLength / (prevRunLength + 5)
  *
  * Negative values (run length grew) are clamped to 0, giving a near-zero
- * score for stable growth.
+ * score for stable growth.  The maturity shrink prevRL/(prevRL+5) makes a
+ * reset of a barely-established run (e.g. 2 → 0, routine noise early in a
+ * sequence) score far lower than the reset of a long run (200 → 0, a genuine
+ * changepoint) — without it both would give the same relative drop of 1.
  *
  * A sigmoid centred at drop = 0.5:
- *   drop = 0    (no drop, or run grew)          → score ≈ 0.12
- *   drop = 0.5  (RL halved)                     → score ≈ 0.50
- *   drop ≥ 0.9  (RL reset, e.g. 90 → 1)        → score ≈ 0.98
+ *   drop = 0    (no drop, or run grew)              → score ≈ 0.02
+ *   full reset from prevRL = 2   (drop ≈ 0.29)      → score ≈ 0.15
+ *   full reset from prevRL = 10  (drop ≈ 0.67)      → score ≈ 0.79
+ *   full reset from prevRL = 50  (drop ≈ 0.91)      → score ≈ 0.96
  *
  * Pass prevRunLength = 0 (or omit) for the very first step; the function
  * returns 0 in that case.
@@ -240,7 +246,8 @@ export function bocpdAnomalyScore(result: BocpdUpdateResult, prevRunLength = 0):
   // NaN <= 0 is false (IEEE 754), and (Infinity - finite) / Infinity = NaN.
   // Guard both: require prevRunLength to be a finite positive number.
   if (!Number.isFinite(prevRunLength) || prevRunLength <= 0) return 0;
-  const drop = Math.max(0, (prevRunLength - result.mapRunLength) / prevRunLength);
+  const rawDrop = Math.max(0, (prevRunLength - result.mapRunLength) / prevRunLength);
+  const drop    = rawDrop * (prevRunLength / (prevRunLength + 5));
   return 1 / (1 + Math.exp(-(drop - 0.5) * 8));
 }
 

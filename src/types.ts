@@ -56,6 +56,24 @@ export interface DetectionResult {
   anomaly:        boolean;
   /** Probability [0,1] that the current window contains an anomaly */
   confidence:     number;
+  /**
+   * Raw sub-detector scores [0,1] regardless of signal thresholds.
+   * confidence = scoreWeights · [hawkes, cusum, bocpd] (weights renormalized
+   * when the window is too short for the rolling detectors to run).
+   */
+  scores:         { hawkes: number; cusum: number; bocpd: number };
+  /**
+   * Raw volume/rate statistics behind scores.hawkes:
+   * robust z ("σ above recent typical") of the peak rolling arrival rate and
+   * volume rate at the fast/slow horizons, plus the peak-λ ratio vs training.
+   */
+  stats:          {
+    zRate:       number;
+    zVol:        number;
+    zRateSlow:   number;
+    zVolSlow:    number;
+    lambdaRatio: number;
+  };
   /** Per-detector signals that fired */
   signals:        AnomalySignal[];
   /** Estimated imbalance [-1,+1]: positive = buy pressure */

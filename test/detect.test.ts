@@ -378,7 +378,7 @@ describe('detect(): calm vs anomaly', () => {
 // ─── 7. Signal meta fields ────────────────────────────────────────────────────
 
 describe('detect(): signal meta', () => {
-  it('volume_spike meta has lambda, mu, branching', () => {
+  it('volume_spike meta has lambda and the z statistics', () => {
     const rng  = makeLCG(0x50505050);
     const hist = makeCalm(500, rng, 0);
     const rec  = buildStream([{ ...CALM, count: 50 }, BURST], 800_000, rng);
@@ -386,10 +386,11 @@ describe('detect(): signal meta', () => {
     const spike = r.signals.find(s => s.kind === 'volume_spike');
     if (spike) {
       expect(typeof spike.meta['lambda']).toBe('number');
-      expect(typeof spike.meta['mu']).toBe('number');
-      expect(typeof spike.meta['branching']).toBe('number');
-      expect(spike.meta['branching']).toBeGreaterThanOrEqual(0);
-      expect(spike.meta['branching']).toBeLessThan(1);  // subcritical
+      expect(typeof spike.meta['zRate']).toBe('number');
+      expect(typeof spike.meta['zVol']).toBe('number');
+      expect(typeof spike.meta['zRateSlow']).toBe('number');
+      expect(typeof spike.meta['zVolSlow']).toBe('number');
+      expect(typeof spike.meta['lambdaRatio']).toBe('number');
     }
   });
 

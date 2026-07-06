@@ -649,36 +649,41 @@ describe('detect(): unsorted input gives same result as sorted', () => {
 
 // ─── 14. bocpdAnomalyScore: точные граничные значения ───────────────────────
 //
-// bocpd.ts:216 — sig((drop-0.5)*8).
-// drop=0 → sig(-4) ≈ 0.018; drop=0.5 → sig(0) = 0.5; drop=1 → sig(4) ≈ 0.982.
+// bocpd.ts — sig((drop-0.5)*8), где drop = rawDrop · prevRL/(prevRL+5)
+// (сжатие по зрелости рана: сброс короткого рана — рутинный шум, длинного —
+// настоящая разладка).
+// prevRL=10 → shrink = 10/15 = 2/3:
+//   rawDrop=0   → sig(-4)          ≈ 0.018
+//   rawDrop=0.5 → sig((1/3-0.5)·8) ≈ 0.209
+//   rawDrop=1   → sig((2/3-0.5)·8) ≈ 0.791
 
 describe('bocpdAnomalyScore: exact sigmoid values at key drop points', () => {
   const r0 = { mapRunLength: 0, cpProbability: 0, state: bocpdInitState() };
+  const shrink10 = 10 / 15; // prevRL=10
 
   it('drop = 0 (no change): score = sig(-4) ≈ 0.018', () => {
     const r = { mapRunLength: 10, cpProbability: 0, state: bocpdInitState() };
-    const score = bocpdAnomalyScore(r, 10); // (10-10)/10 = 0
+    const score = bocpdAnomalyScore(r, 10); // rawDrop = (10-10)/10 = 0
     const expected = 1 / (1 + Math.exp(4));  // sig((0-0.5)*8) = sig(-4)
     expect(score).toBeCloseTo(expected, 8);
   });
 
-  it('drop = 0.5 (RL halved): score = 0.5 (sigmoid at center)', () => {
+  it('rawDrop = 0.5 (RL halved), prevRL=10: score = sig((1/3−0.5)·8) ≈ 0.209', () => {
     const r = { mapRunLength: 5, cpProbability: 0, state: bocpdInitState() };
-    const score = bocpdAnomalyScore(r, 10); // (10-5)/10 = 0.5
-    expect(score).toBeCloseTo(0.5, 5);
-  });
-
-  it('drop = 1.0 (full reset to 0): score = sig(4) ≈ 0.982', () => {
-    const score = bocpdAnomalyScore(r0, 10); // (10-0)/10 = 1.0
-    const expected = 1 / (1 + Math.exp(-4)); // sig((1-0.5)*8) = sig(4)
+    const score = bocpdAnomalyScore(r, 10); // rawDrop = 0.5, drop = 0.5·(2/3)
+    const expected = 1 / (1 + Math.exp(-(0.5 * shrink10 - 0.5) * 8));
     expect(score).toBeCloseTo(expected, 8);
   });
 
-  it('drop > 1 is impossible (mapRL >= 0 always), but clamping prevents score > sig(4)', () => {
-    // mapRunLength=0, prevRL=10 → drop=(10-0)/10=1.0 → clamped to 1.0
-    // Негативный mapRL невозможен в реальности, но если бы: drop = (10-(-5))/10 = 1.5
-    // Math.max(0, 1.5) → drop = 1.5 → не обрезается, но это нереально
-    const score = bocpdAnomalyScore(r0, 10);
+  it('rawDrop = 1.0 (full reset), prevRL=10: score = sig((2/3−0.5)·8) ≈ 0.791', () => {
+    const score = bocpdAnomalyScore(r0, 10); // rawDrop = 1, drop = 2/3
+    const expected = 1 / (1 + Math.exp(-(1 * shrink10 - 0.5) * 8));
+    expect(score).toBeCloseTo(expected, 8);
+  });
+
+  it('full reset of a mature run (prevRL=100) scores > 0.9; score never exceeds 1', () => {
+    // shrink = 100/105 → drop ≈ 0.952 → sig(3.62) ≈ 0.974
+    const score = bocpdAnomalyScore(r0, 100);
     expect(score).toBeLessThanOrEqual(1);
     expect(score).toBeGreaterThan(0.9);
   });

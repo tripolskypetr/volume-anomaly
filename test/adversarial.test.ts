@@ -267,10 +267,11 @@ describe('detector: identical timestamps edge case', () => {
     expect(result.confidence).toBeLessThanOrEqual(1);
   });
 
-  it('balanced identical-timestamp trades do not trigger anomaly at default threshold', () => {
-    // 50 трейдов с одним timestamp, чередующиеся buy/sell → imbalance≈0.
-    // hawkesScore может быть высоким из-за rate spike, но CUSUM/BOCPD молчат.
-    // combined = 0.4·hawkes + 0 + 0 = 0.4 < 0.75.
+  it('balanced identical-timestamp burst IS a rate anomaly (imbalance stays ≈ 0)', () => {
+    // 50 трейдов в один и тот же миг — настоящий rate burst; volume-канал
+    // (веса по умолчанию [1,0,0]) обязан его флагать.  Сбалансированность
+    // потока выражается не в подавлении аномалии, а в imbalance ≈ 0
+    // (direction=neutral на уровне predict()).
     const det = new VolumeAnomalyDetector({ windowSize: 10 });
     det.train(makeHist());
 
@@ -278,7 +279,8 @@ describe('detector: identical timestamps edge case', () => {
     for (let i = 0; i < 50; i++) recent.push(trade(500_000, 1, i % 2 === 0));
 
     const result = det.detect(recent, 0.75);
-    expect(result.anomaly).toBe(false);
+    expect(result.anomaly).toBe(true);
+    expect(Math.abs(result.imbalance)).toBeLessThan(0.1);
     expect(Number.isFinite(result.hawkesLambda)).toBe(true);
   });
 });

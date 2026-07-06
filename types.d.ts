@@ -41,6 +41,28 @@ interface DetectionResult {
     anomaly: boolean;
     /** Probability [0,1] that the current window contains an anomaly */
     confidence: number;
+    /**
+     * Raw sub-detector scores [0,1] regardless of signal thresholds.
+     * confidence = scoreWeights · [hawkes, cusum, bocpd] (weights renormalized
+     * when the window is too short for the rolling detectors to run).
+     */
+    scores: {
+        hawkes: number;
+        cusum: number;
+        bocpd: number;
+    };
+    /**
+     * Raw volume/rate statistics behind scores.hawkes:
+     * robust z ("σ above recent typical") of the peak rolling arrival rate and
+     * volume rate at the fast/slow horizons, plus the peak-λ ratio vs training.
+     */
+    stats: {
+        zRate: number;
+        zVol: number;
+        zRateSlow: number;
+        zVolSlow: number;
+        lambdaRatio: number;
+    };
     /** Per-detector signals that fired */
     signals: AnomalySignal[];
     /** Estimated imbalance [-1,+1]: positive = buy pressure */
@@ -97,7 +119,9 @@ interface NormalGammaPrior {
  * Alarm fires when Sₜ ≥ h.
  *
  * Applied to volume imbalance:
- *   xₜ  = |imbalance(window)| — we track absolute deviation, so one-sided S⁺ suffices.
+ *   xₜ  = |imbalance(window)| — S⁺ catches pressure buildup (|imb| rising above
+ *         baseline), S⁻ catches collapse toward balance (|imb| falling below
+ *         baseline); both are regime changes, so the score uses max(S⁺, S⁻).
  *   μ₀  = baseline mean imbalance magnitude (from training window)
  *   k   = allowable slack  = δ/2  (typically δ = 1 std-dev)
  *   h   = alarm threshold (tuned to ARL₀ — average run length under H₀)
@@ -145,8 +169,28 @@ interface DetectorConfig {
     /**
      * Weights for combining sub-detector scores into a final confidence.
      * Must be 3 values [hawkes, cusum, bocpd] summing to 1.
+     *
+     * Default [1, 0, 0]: on real trade data the volume/rate channel (hawkes)
+     * is the only one that discriminates volume anomalies; the imbalance-based
+     * CUSUM/BOCPD channels track order-flow regime shifts (a different
+     * phenomenon) and any additive weight on them measurably dilutes recall and
+     * adds false alarms (see test/eval.test.ts).  Their scores are still
+     * computed and reported in `scores`/`signals` — re-weight only if your use
+     * case specifically targets flow-shift events.
      */
     scoreWeights?: [number, number, number];
+    /**
+     * Fast time horizon (seconds) for the rate / volume-rate statistic:
+     * "trades per rateHorizonSec" and "qty per rateHorizonSec".  Catches brief
+     * intense bursts.  Default 5 s.
+     */
+    rateHorizonSec?: number;
+    /**
+     * Slow time horizon (seconds) for the same statistic.  Catches sustained
+     * volume waves that are spread too evenly to concentrate at the fast
+     * horizon.  Default 30 s.
+     */
+    slowHorizonSec?: number;
     /**
      * Percentile (0–100) of the training rolling signed imbalance distribution
      * used as the directional threshold inside predict().
@@ -162,6 +206,40 @@ interface TrainedModels {
     bocpdPrior: NormalGammaPrior;
     /** p(imbalancePercentile) of the training rolling signed imbalance series */
     imbalanceThreshold: number;
+    /**
+     * Self-calibrated ceilings measured on the training window.
+     *
+     * Theory-driven thresholds ("2× fitted μ", "h = 5σ") misfire on real trade
+     * streams: arrival rates fluctuate several-fold between adjacent windows and
+     * the rolling |imbalance| series is heavily autocorrelated, so those levels
+     * correspond to routine noise.  Instead each detector is calibrated against
+     * what the (in-control) training window itself actually reached — an anomaly
+     * must exceed the baseline's own extremes with margin.
+     */
+    /**
+     * Robust location/scale of the rolling arrival rate (events/s) and rolling
+     * volume rate (qty/s), per horizon.  detect() scores its peak rolling rate
+     * as a robust z against these: z = (peak − med) / (1.4826 · MAD).
+     * "fast" = rateHorizonSec (brief bursts), "slow" = slowHorizonSec (sustained
+     * volume waves spread too evenly to concentrate at the fast horizon).
+     */
+    rateStats: {
+        fast: RobustStats;
+        slow: RobustStats;
+    };
+    volStats: {
+        fast: RobustStats;
+        slow: RobustStats;
+    };
+    /** Peak λ(tᵢ) over the training window under the fitted Hawkes params */
+    lambdaBaseline: number;
+    /** Peak BOCPD anomaly score over the training series (noise floor) */
+    bocpdNoiseFloor: number;
+}
+/** Robust location/scale: median + MAD. */
+interface RobustStats {
+    med: number;
+    mad: number;
 }
 declare class VolumeAnomalyDetector {
     private readonly cfg;
@@ -179,6 +257,28 @@ declare class VolumeAnomalyDetector {
      * @param confidence Required confidence threshold [0,1]. Default 0.75.
      */
     detect(trades: IAggregatedTradeData[], confidence?: number): DetectionResult;
+    /**
+     * Arrival rate (events/s) and volume rate (qty/s) over a rolling TIME
+     * window of rateHorizonSec, one sample per trade.  This is the shared
+     * statistic for calibration: train() takes P99 of it as the baseline
+     * ceiling, detect() takes its max as the detection statistic — same horizon
+     * on both sides, so the ratio is apples-to-apples.
+     *
+     * The horizon must be a time span, not a trade count: a fixed-count window
+     * ("last 50 trades") is rate-invariant by construction — during a burst it
+     * simply shrinks in duration and its count/duration reflects matching-engine
+     * micro-batching, not the burst.  A volume anomaly is "more trades / more
+     * quantity per unit TIME", so the statistic has to be measured per unit time.
+     *
+     * Only full-horizon windows are scored: near the start of the array the
+     * lookback would be truncated to data that isn't there, and dividing a
+     * burst of leading trades by a floored duration reads as a phantom rate
+     * spike that full-lookback training samples never contain.  When the whole
+     * array spans less than the horizon, a single whole-window sample is
+     * returned instead (duration floored at min(1 s, horizon) so that a clump
+     * of same-millisecond trades still yields a finite, comparable rate).
+     */
+    private rollingRates;
     private rollingAbsImbalance;
     private rollingSignedImbalance;
     private emptyResult;

@@ -10,7 +10,9 @@
  * Alarm fires when Sₜ ≥ h.
  *
  * Applied to volume imbalance:
- *   xₜ  = |imbalance(window)| — we track absolute deviation, so one-sided S⁺ suffices.
+ *   xₜ  = |imbalance(window)| — S⁺ catches pressure buildup (|imb| rising above
+ *         baseline), S⁻ catches collapse toward balance (|imb| falling below
+ *         baseline); both are regime changes, so the score uses max(S⁺, S⁻).
  *   μ₀  = baseline mean imbalance magnitude (from training window)
  *   k   = allowable slack  = δ/2  (typically δ = 1 std-dev)
  *   h   = alarm threshold (tuned to ARL₀ — average run length under H₀)
@@ -44,8 +46,12 @@ export function cusumFit(values: number[], kSigmas = 0.5, hSigmas = 4): CusumPar
   // A single NaN in `values` would make mu0 = NaN, which later poisons the
   // CUSUM accumulator even for valid observations (Math.max(0, x − NaN) = NaN).
   const clean = values.filter(Number.isFinite);
-  if (clean.length === 0) {
-    return { mu0: 0, std0: 1, k: kSigmas, h: hSigmas };
+  if (clean.length < 2) {
+    // 0 samples: nothing to estimate.  1 sample: mean is known but spread is
+    // not — falling through would give var0 = 0 → std0 = 1e-6, making h
+    // microscopic and CUSUM alarm on any deviation from that single value.
+    // Fall back to a wide std0 = 1 instead (conservative: fewer false alarms).
+    return { mu0: clean[0] ?? 0, std0: 1, k: kSigmas, h: hSigmas };
   }
   const n    = clean.length;
   const mu0  = clean.reduce((s, x) => s + x, 0) / n;
