@@ -21,6 +21,10 @@
  *     making 'neutral' unreachable.  The threshold is now clamped at zero.
  *  8. detect() on very large windows: Math.max(...rates) spread overflowed the
  *     call stack (RangeError) at ~10⁶ trades.
+ *  9. Zero-variance CUSUM baseline: a constant training |imbalance| series
+ *     (fully one-sided flow) collapsed std0 to the 1e-6 numerical floor, so
+ *     with custom scoreWeights any deviation raised cusum_alarm at score 1.
+ *     Now takes the same wide std0 = 1 fallback as the <2-samples case.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -303,4 +307,50 @@ describe('detect() with ~10⁶ trades does not overflow the call stack', () => {
     const result = detector.detect(big, 0.75);
     expect(Number.isFinite(result.confidence)).toBe(true);
   }, 60_000);
+});
+
+// ─── 9. CUSUM on a zero-variance baseline ─────────────────────────────────────
+
+describe('constant |imbalance| baseline does not make CUSUM hypersensitive', () => {
+  /** All-sell stream: |imbalance| = 1 in every rolling window → zero variance */
+  function makeOneSided(n: number, startTs: number): IAggregatedTradeData[] {
+    return Array.from({ length: n }, (_, i) => makeTrade(startTs + i * 1000, 1, true));
+  }
+
+  it('trained h is not microscopic', () => {
+    const det = new VolumeAnomalyDetector();
+    det.train(makeOneSided(500, 0));
+    // Wide fallback: std0 = 1 → h = 5σ = 5, not 5e-6.
+    expect(det.trainedModels!.cusumParams.std0).toBe(1);
+    expect(det.trainedModels!.cusumParams.h).toBeGreaterThan(1);
+  });
+
+  it('routine flow jitter after one-sided training → no cusum_alarm', () => {
+    const det = new VolumeAnomalyDetector({ scoreWeights: [0, 1, 0] });
+    det.train(makeOneSided(500, 0));
+
+    // 96–97% sell with scattered single buys: |imbalance| wiggles in 0.92–1.
+    // Before the fix each such window instantly alarmed at score 1.
+    const rec: IAggregatedTradeData[] = [];
+    for (let i = 0; i < 200; i++) {
+      rec.push(makeTrade(600_000 + i * 1000, 1, i % 33 !== 0)); // every 33rd trade is a buy
+    }
+    const r = det.detect(rec, 0.75);
+
+    expect(r.signals.every((s) => s.kind !== 'cusum_alarm')).toBe(true);
+    expect(r.scores.cusum).toBeLessThan(0.5);
+    expect(r.anomaly).toBe(false);
+  });
+
+  it('genuine flow collapse after one-sided training still alarms', () => {
+    const det = new VolumeAnomalyDetector({ scoreWeights: [0, 1, 0] });
+    det.train(makeOneSided(500, 0));
+
+    // Alternating buy/sell → |imbalance| = 0 sustained: a full regime change
+    // from the |imbalance| = 1 baseline accumulates 0.5σ/step and must alarm.
+    const r = det.detect(makeCalm(200, 600_000, 1000), 0.75);
+
+    expect(r.signals.some((s) => s.kind === 'cusum_alarm')).toBe(true);
+    expect(r.anomaly).toBe(true);
+  });
 });

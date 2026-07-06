@@ -56,7 +56,13 @@ export function cusumFit(values: number[], kSigmas = 0.5, hSigmas = 4): CusumPar
   const n    = clean.length;
   const mu0  = clean.reduce((s, x) => s + x, 0) / n;
   const var0 = clean.reduce((s, x) => s + (x - mu0) ** 2, 0) / Math.max(n - 1, 1);
-  const std0 = Math.sqrt(var0) || 1e-6;
+  // Zero variance (constant series — e.g. |imbalance| pinned at 1 by fully
+  // one-sided flow) carries no more spread information than a single sample,
+  // so it takes the same wide std0 = 1 fallback.  The old 1e-6 numerical
+  // floor made k/h microscopic, so any deviation from the constant alarmed
+  // instantly at score 1 — and the detector's train() probe cannot rescue
+  // this case, because a constant training series produces zero excursions.
+  const std0 = Math.sqrt(var0) || 1;
   return {
     mu0,
     std0,

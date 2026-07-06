@@ -477,25 +477,28 @@ describe('VolumeAnomalyDetector.train() boundary', () => {
   });
 });
 
-// ─── 12. cusumFit with a single value ────────────────────────────────────────
+// ─── 12. cusumFit with degenerate variance ───────────────────────────────────
 //
-// n=1 → var = (x - mean)^2 / max(n-1, 1) = 0 / 1 = 0 → std0 = 0.
-// Code: std0 = Math.sqrt(var0) || 1e-6 → falls back to 1e-6 (truthy check fails for 0).
-// Test: no NaN/Infinity, std0 > 0, k and h are positive.
+// n=1 → the <2-samples branch returns the wide std0 = 1 fallback.
+// A constant array (n ≥ 2, zero variance) carries no spread information either
+// and must take the SAME wide fallback: the old 1e-6 numerical floor made k/h
+// microscopic, so any deviation from the constant alarmed instantly at score 1
+// (train()'s probe calibration can't rescue that — a constant series produces
+// zero probe excursions).
 
-describe('cusumFit: single-value array', () => {
-  it('std0 falls back to 1e-6, not 0 or NaN', () => {
+describe('cusumFit: degenerate variance falls back to wide std0', () => {
+  it('single value: std0 = 1, not 0 or NaN', () => {
     const p = cusumFit([0.5]);
-    expect(Number.isFinite(p.std0)).toBe(true);
-    expect(p.std0).toBeGreaterThan(0);
+    expect(p.std0).toBe(1);
     expect(p.mu0).toBeCloseTo(0.5, 10);
     expect(p.k).toBeGreaterThan(0);
     expect(p.h).toBeGreaterThan(0);
   });
 
-  it('constant array (zero variance) gives std0 = 1e-6', () => {
+  it('constant array (zero variance) gives the same wide std0 = 1', () => {
     const p = cusumFit([3, 3, 3, 3, 3]);
-    expect(p.std0).toBeCloseTo(1e-6, 10);
+    expect(p.std0).toBe(1);
+    expect(p.mu0).toBeCloseTo(3, 10);
     expect(Number.isFinite(p.k)).toBe(true);
     expect(Number.isFinite(p.h)).toBe(true);
   });

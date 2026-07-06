@@ -478,18 +478,21 @@ describe('detect() with single trade in window', () => {
 // Экстремальные значения (0 и 1) — граничные для |imbalance|.
 
 describe('cusumFit: extremes of |imbalance| range', () => {
-  it('all zeros: std0 = 1e-6, mu0 = 0', () => {
+  it('all zeros: wide fallback std0 = 1, mu0 = 0', () => {
     const p = cusumFit(Array(50).fill(0));
     expect(p.mu0).toBeCloseTo(0, 10);
-    expect(p.std0).toBeCloseTo(1e-6, 10); // std=0 → fallback 1e-6
+    // variance=0 → тот же широкий fallback std0 = 1, что и при <2 сэмплах
+    // (старый флор 1e-6 делал h микроскопическим → cusum_alarm на любом
+    // отклонении от константы).
+    expect(p.std0).toBe(1);
     expect(p.k).toBeGreaterThan(0);
     expect(p.h).toBeGreaterThan(0);
   });
 
-  it('all ones: mu0 = 1, std0 = 1e-6 (variance=0)', () => {
+  it('all ones: mu0 = 1, wide fallback std0 = 1 (variance=0)', () => {
     const p = cusumFit(Array(50).fill(1));
     expect(p.mu0).toBeCloseTo(1, 10);
-    expect(p.std0).toBeCloseTo(1e-6, 10); // variance=0 → fallback
+    expect(p.std0).toBe(1);
   });
 
   it('alternating 0 and 1: mu0 ≈ 0.5, std0 ≈ 0.5', () => {
