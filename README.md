@@ -202,8 +202,8 @@ const { hawkesParams, cusumParams, bocpdPrior } = detector.trainedModels!;
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `windowSize` | `number` | `50` | Number of trades per rolling imbalance window (CUSUM/BOCPD). Smaller = more reactive to local shifts, larger = smoother signal |
-| `rateHorizonSec` | `number` | `5` | Fast time horizon for the volume channel: "trades per 5 s" / "qty per 5 s". Catches brief intense bursts |
-| `slowHorizonSec` | `number` | `30` | Slow horizon for the same statistic. Catches sustained volume waves spread too evenly to concentrate at the fast horizon |
+| `rateHorizonSec` | `number` | auto (≥ 5) | Fast time horizon for the volume channel: "trades per horizon" / "qty per horizon". Catches brief intense bursts. When omitted, chosen on the fly: max(5 s, 25 × median inter-trade gap), capped by the training span — sparse instruments automatically get a horizon that carries a meaningful rate. Pass a value to pin it |
+| `slowHorizonSec` | `number` | auto (≥ 30) | Slow horizon for the same statistic. Catches sustained volume waves spread too evenly to concentrate at the fast horizon. Auto: 6 × fast horizon, floored at 30 s, capped by the training span |
 | `hazardLambda` | `number` | `200` | Expected number of windows between changepoints (BOCPD hazard rate H = 1/λ). Set lower for more frequent regime changes |
 | `cusumKSigmas` | `number` | `0.5` | CUSUM allowable slack k in σ units. Controls sensitivity: lower k = faster response but more false positives |
 | `cusumHSigmas` | `number` | `5` | CUSUM alarm threshold floor in σ units; the effective `h` is self-calibrated as `max(hSigmas·σ, 2 × max training excursion)` because the rolling series is heavily autocorrelated |
@@ -226,7 +226,7 @@ score_final = w_H · score_volume + w_C · score_cusum + w_B · score_bocpd
 anomaly     = score_final >= confidence
 ```
 
-The volume-channel score is a sigmoid over the peak robust z of the rolling rate/volume statistics: `score = σ((z − 12) · 0.4)`, so `confidence` maps directly to a z-level: 0.5 ⇒ z ≈ 12, 0.75 ⇒ z ≈ 14.7, 0.9 ⇒ z ≈ 17.5. The mapping is calibrated on a full day of real BTCUSDT trades (`test/eval.test.ts`).
+The volume-channel score is a sigmoid over the peak robust z of the rolling rate/volume statistics: `score = σ((z − c) · ln3/u)`. The level `c` and tail unit `u` are chosen **on the fly at `train()` time**: `c` = P90 of the peak-z values the baseline itself produced in alert-sized stretches (floored by a universal level validated on a full day of real BTCUSDT trades, `test/eval.test.ts`); `u` is universal in z-space. On a typical baseline this gives 0.5 ⇒ z ≈ 12, 0.75 ⇒ z ≈ 14.7, 0.9 ⇒ z ≈ 17.5; a hotter/noisier baseline automatically raises the bar.
 
 **Practical guidance** (measured on the real-data benchmark, 30 s buckets):
 
@@ -520,20 +520,31 @@ The sigmoid is centred at `drop = 0.5` with steepness 8. The score is taken as t
 The volume channel is the score that matters by default:
 
 ```
-score_volume = max over channels of  σ((z − 12) · 0.4)
-  channels:  z of peak "trades per rateHorizonSec"   (fast arrival bursts)
-             z of peak "qty per rateHorizonSec"      (fast volume bursts, block trades)
-             z of peak "trades per slowHorizonSec"   (sustained arrival waves)
-             z of peak "qty per slowHorizonSec"      (sustained volume waves)
+score_volume = max over channels of  σ((z − c_ch − u·spanShift) · ln3 / u)
+  channels:  z of peak "trades per fast horizon"   (fast arrival bursts)
+             z of peak "qty per fast horizon"      (fast volume bursts, block trades)
+             z of peak "trades per slow horizon"   (sustained arrival waves)
+             z of peak "qty per slow horizon"      (sustained volume waves)
 
-  z = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median_train))
+  z    = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median_train))
+  c_ch = max(P90 of the peak-z the baseline itself produced in slow-horizon
+             stretches, universal floor)                     → score 0.5
+  u    = universal tail unit; c_ch + u                        → score 0.75
+  spanShift = log10(max(1, detectionSpan / slowHorizon))      (longer window ⇒
+              more independent looks at the max ⇒ higher bar)
 
 confidence_score = w_H · score_volume + w_C · score_cusum + w_B · score_bocpd
                  = score_volume                          (default weights [1, 0, 0])
 anomaly          = confidence_score >= confidence_threshold
 ```
 
-All four channels are **self-calibrated**: the yardstick is measured on the training window itself, so the same code adapts to any instrument's activity level. There are no theoretical thresholds ("2× the fitted μ", "5σ under i.i.d.") — those were tested on real data and misfire badly (28 % false alarms), because real trade streams are heavily autocorrelated and heavy-tailed.
+Everything instrument-specific is chosen **on the fly at `train()` time**:
+
+- **Horizons** — scaled up from the median inter-trade gap for sparse streams (config values are floors; pass explicit values to pin them).
+- **Yardstick (median/MAD)** — measured per channel on the training window.
+- **Score level `c_ch`** — the baseline's own null distribution of window maxima, floored by the universal mapping validated on a full day of real BTCUSDT trades. A baseline that itself contains recurring bursts absorbs them into its null quantiles, so a repeat of a known pattern scores ≈ 0.5 rather than 1.0.
+
+There are no theoretical thresholds ("2× the fitted μ", "5σ under i.i.d.") — those were tested on real data and misfire badly (28 % false alarms), because real trade streams are heavily autocorrelated and heavy-tailed. The two remaining fixed anchors (the universal floor level and tail unit) live in standardized z-space, were validated end-to-end on the benchmark, and act only as a sensitivity *limit* — the data can make the detector stricter, never more trigger-happy.
 
 **Signals** are individual detector firings appended to `result.signals` when:
 

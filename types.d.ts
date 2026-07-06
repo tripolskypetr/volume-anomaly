@@ -182,13 +182,19 @@ interface DetectorConfig {
     /**
      * Fast time horizon (seconds) for the rate / volume-rate statistic:
      * "trades per rateHorizonSec" and "qty per rateHorizonSec".  Catches brief
-     * intense bursts.  Default 5 s.
+     * intense bursts.
+     *
+     * When omitted, chosen on the fly: max(5 s, 25 × median inter-trade gap),
+     * capped by the training span — so sparse instruments automatically get a
+     * horizon that contains enough trades for the statistic to mean anything.
+     * Pass an explicit value to pin it.
      */
     rateHorizonSec?: number;
     /**
      * Slow time horizon (seconds) for the same statistic.  Catches sustained
      * volume waves that are spread too evenly to concentrate at the fast
-     * horizon.  Default 30 s.
+     * horizon.  When omitted: 6 × the (auto) fast horizon, floored at 30 s and
+     * capped by the training span.  Pass an explicit value to pin it.
      */
     slowHorizonSec?: number;
     /**
@@ -220,8 +226,8 @@ interface TrainedModels {
      * Robust location/scale of the rolling arrival rate (events/s) and rolling
      * volume rate (qty/s), per horizon.  detect() scores its peak rolling rate
      * as a robust z against these: z = (peak − med) / (1.4826 · MAD).
-     * "fast" = rateHorizonSec (brief bursts), "slow" = slowHorizonSec (sustained
-     * volume waves spread too evenly to concentrate at the fast horizon).
+     * "fast" = brief bursts, "slow" = sustained volume waves spread too evenly
+     * to concentrate at the fast horizon.
      */
     rateStats: {
         fast: RobustStats;
@@ -230,6 +236,23 @@ interface TrainedModels {
     volStats: {
         fast: RobustStats;
         slow: RobustStats;
+    };
+    /**
+     * Effective horizons chosen at train() time (seconds).  Equal to the config
+     * values when pinned explicitly; otherwise scaled up on the fly for sparse
+     * streams so a horizon window contains enough trades to carry a rate.
+     */
+    fastHorizonSec: number;
+    slowHorizonSec: number;
+    /**
+     * Per-channel score calibration from the null distribution of window maxima
+     * over the training data (see ChannelCalib / calibrateChannel).
+     */
+    channelCalib: {
+        rateFast: ChannelCalib;
+        volFast: ChannelCalib;
+        rateSlow: ChannelCalib;
+        volSlow: ChannelCalib;
     };
     /** Peak λ(tᵢ) over the training window under the fitted Hawkes params */
     lambdaBaseline: number;
@@ -241,9 +264,34 @@ interface RobustStats {
     med: number;
     mad: number;
 }
+/**
+ * Per-channel score mapping, self-calibrated from the null distribution of
+ * window maxima on the training data (see calibrateChannel):
+ *
+ *   score(z) = σ((z − c − u·spanShift) · ln3 / u)
+ *
+ *   c = P90 of the maxima the baseline itself produced    → score 0.5
+ *   c + u (one tail unit, u = P99 − P90 of those maxima)  → score 0.75
+ *   each further u beyond that                            → 0.9, 0.96, …
+ *
+ * Both anchors are floored by the universal mapping validated on a full day
+ * of real data (CALIB_FALLBACK): the baseline's own null distribution can
+ * only make the detector stricter (hot/noisy baseline ⇒ higher, wider
+ * mapping), never more trigger-happy — a 15–30 min window yields too few
+ * null stretches to trust a low estimate of the normal tail.
+ */
+interface ChannelCalib {
+    /** Score-0.5 level: max(null P90 of window maxima, universal floor) */
+    c: number;
+    /** Tail unit: max(null P99 − P90, universal floor); one u beyond c ⇒ 0.75 */
+    u: number;
+}
 declare class VolumeAnomalyDetector {
     private readonly cfg;
     private models;
+    /** User pinned the horizon explicitly — skip on-the-fly selection */
+    private readonly explicitFast;
+    private readonly explicitSlow;
     constructor(config?: DetectorConfig);
     /**
      * Fit all models to historical (in-control) trade data.
@@ -279,6 +327,24 @@ declare class VolumeAnomalyDetector {
      * of same-millisecond trades still yields a finite, comparable rate).
      */
     private rollingRates;
+    /**
+     * Build the score mapping for one channel from the null distribution of its
+     * window maxima on the training data.
+     *
+     * The training z-series is cut into sliding stretches of windowSec (the
+     * slow-horizon alert timescale), stepped by windowSec/4; the maximum z of
+     * each stretch is one null sample — "the worst this baseline does in one
+     * alert window".  The mapping anchors on the quantiles of those maxima:
+     * P99 → score 0.5, P99 + (P99−P90) → score 0.75.  No instrument-specific
+     * constants:
+     * a noisy instrument gets a wide mapping, a quiet one a tight mapping, and
+     * a baseline that itself contains recurring bursts absorbs them into its
+     * null quantiles (a repeat of a known pattern scores ≈ 0.5, not 1.0).
+     *
+     * Falls back to the fixed real-data calibration when the training span
+     * yields fewer than 8 stretches.
+     */
+    private calibrateChannel;
     private rollingAbsImbalance;
     private rollingSignedImbalance;
     private emptyResult;

@@ -125,13 +125,14 @@ describe('false positive: trending market (high imbalance, normal rate)', () => 
 
 // ─── 4. Разовый крупный трейд («кит»), после которого рынок спокойный ─────────
 //
-// Один трейд с qty в 100× больше среднего. Классическая «свеча» кита.
-// После него — ничего. Такой трейд сдвигает imbalance за один шаг,
-// но CUSUM и BOCPD видят это как единичный всплеск в окне —
-// нет sustained deviation (нет аномалии ставки, нет смены режима).
+// Один трейд с qty в 100× больше среднего, размазанный по 80-секундному окну.
+// Объёмный канал ВИДИТ его (z по объёму заметно выше нормы — проверяется в
+// stats), но одиночный принт без продолжения не дотягивает до планки
+// «однозначная аномалия» (score-0.5 уровень = собственный P90-пик базы с
+// универсальным полом): алерта на дефолтном пороге 0.75 нет.
 
 describe('false positive: single whale trade', () => {
-  it('single 100× trade followed by calm does not trigger', () => {
+  it('single 100× trade followed by calm: visible in stats, no alert at 0.75', () => {
     const hist: IAggregatedTradeData[] = [];
     for (let i = 0; i < 400; i++) {
       hist.push(trade(i * 1000, 1, i % 2 === 0));
@@ -145,9 +146,9 @@ describe('false positive: single whale trade', () => {
     }
 
     const r = detect(hist, rec, 0.75);
-    // Один кит — нет rate spike (windowSec≈80s, 80 трейдов → нормальный rate)
-    // imbalance смещён, но CUSUM/BOCPD видят 1 аномальный step из ~70 → нет sustained
     expect(r.anomaly).toBe(false);
+    // …но объёмный канал его видит: z существенно выше типичного уровня.
+    expect(Math.max(r.stats.zVol, r.stats.zVolSlow)).toBeGreaterThan(3);
   });
 });
 

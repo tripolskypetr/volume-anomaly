@@ -135,8 +135,11 @@ describe('invariant: confidence monotone in arrival rate', () => {
     const r10 = det.detect(makeBurst(100),  0.0); // 10× (1000/100)
     const r20 = det.detect(makeBurst(50),   0.0); // 20× (1000/50)
 
-    expect(r10.confidence).toBeGreaterThan(r5.confidence);
-    expect(r20.confidence).toBeGreaterThan(r10.confidence);
+    // Монотонность нестрогая: сильные bursts насыщают score у потолка
+    // (кламп 1−1e-9), где 10× и 20× уже неразличимы.
+    expect(r10.confidence).toBeGreaterThanOrEqual(r5.confidence);
+    expect(r20.confidence).toBeGreaterThanOrEqual(r10.confidence);
+    expect(r20.confidence).toBeGreaterThan(0.9); // сильнейший — явно аномален
   });
 
   it('stronger buy imbalance scores higher or equal than weaker', () => {

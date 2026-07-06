@@ -51,13 +51,19 @@ export interface DetectorConfig {
   /**
    * Fast time horizon (seconds) for the rate / volume-rate statistic:
    * "trades per rateHorizonSec" and "qty per rateHorizonSec".  Catches brief
-   * intense bursts.  Default 5 s.
+   * intense bursts.
+   *
+   * When omitted, chosen on the fly: max(5 s, 25 × median inter-trade gap),
+   * capped by the training span — so sparse instruments automatically get a
+   * horizon that contains enough trades for the statistic to mean anything.
+   * Pass an explicit value to pin it.
    */
   rateHorizonSec?: number;
   /**
    * Slow time horizon (seconds) for the same statistic.  Catches sustained
    * volume waves that are spread too evenly to concentrate at the fast
-   * horizon.  Default 30 s.
+   * horizon.  When omitted: 6 × the (auto) fast horizon, floored at 30 s and
+   * capped by the training span.  Pass an explicit value to pin it.
    */
   slowHorizonSec?: number;
   /**
@@ -103,11 +109,28 @@ interface TrainedModels {
    * Robust location/scale of the rolling arrival rate (events/s) and rolling
    * volume rate (qty/s), per horizon.  detect() scores its peak rolling rate
    * as a robust z against these: z = (peak − med) / (1.4826 · MAD).
-   * "fast" = rateHorizonSec (brief bursts), "slow" = slowHorizonSec (sustained
-   * volume waves spread too evenly to concentrate at the fast horizon).
+   * "fast" = brief bursts, "slow" = sustained volume waves spread too evenly
+   * to concentrate at the fast horizon.
    */
   rateStats:           { fast: RobustStats; slow: RobustStats };
   volStats:            { fast: RobustStats; slow: RobustStats };
+  /**
+   * Effective horizons chosen at train() time (seconds).  Equal to the config
+   * values when pinned explicitly; otherwise scaled up on the fly for sparse
+   * streams so a horizon window contains enough trades to carry a rate.
+   */
+  fastHorizonSec:      number;
+  slowHorizonSec:      number;
+  /**
+   * Per-channel score calibration from the null distribution of window maxima
+   * over the training data (see ChannelCalib / calibrateChannel).
+   */
+  channelCalib: {
+    rateFast: ChannelCalib;
+    volFast:  ChannelCalib;
+    rateSlow: ChannelCalib;
+    volSlow:  ChannelCalib;
+  };
   /** Peak λ(tᵢ) over the training window under the fitted Hawkes params */
   lambdaBaseline:      number;
   /** Peak BOCPD anomaly score over the training series (noise floor) */
@@ -158,14 +181,49 @@ function robustZ(x: number, s: RobustStats): number {
   return (x - s.med) / scale;
 }
 
+/**
+ * Per-channel score mapping, self-calibrated from the null distribution of
+ * window maxima on the training data (see calibrateChannel):
+ *
+ *   score(z) = σ((z − c − u·spanShift) · ln3 / u)
+ *
+ *   c = P90 of the maxima the baseline itself produced    → score 0.5
+ *   c + u (one tail unit, u = P99 − P90 of those maxima)  → score 0.75
+ *   each further u beyond that                            → 0.9, 0.96, …
+ *
+ * Both anchors are floored by the universal mapping validated on a full day
+ * of real data (CALIB_FALLBACK): the baseline's own null distribution can
+ * only make the detector stricter (hot/noisy baseline ⇒ higher, wider
+ * mapping), never more trigger-happy — a 15–30 min window yields too few
+ * null stretches to trust a low estimate of the normal tail.
+ */
+interface ChannelCalib {
+  /** Score-0.5 level: max(null P90 of window maxima, universal floor) */
+  c: number;
+  /** Tail unit: max(null P99 − P90, universal floor); one u beyond c ⇒ 0.75 */
+  u: number;
+}
+
+/**
+ * Fallback when the training span is too short to build a null distribution
+ * (< ~2 alert windows).  Values reproduce the mapping measured on a full day
+ * of real BTCUSDT aggTrades (σ((z − 12)·0.4), see test/eval.test.ts).
+ */
+const CALIB_FALLBACK: ChannelCalib = { c: 12, u: Math.log(3) / 0.4 };
+
 // ─── Detector class ───────────────────────────────────────────────────────────
 
 export class VolumeAnomalyDetector {
   private readonly cfg: Required<DetectorConfig>;
   private models:       TrainedModels | null = null;
+  /** User pinned the horizon explicitly — skip on-the-fly selection */
+  private readonly explicitFast: boolean;
+  private readonly explicitSlow: boolean;
 
   constructor(config: DetectorConfig = {}) {
     this.cfg = { ...DEFAULTS, ...config };
+    this.explicitFast = config.rateHorizonSec !== undefined;
+    this.explicitSlow = config.slowHorizonSec !== undefined;
     if (config.scoreWeights) {
       if (!config.scoreWeights.every(Number.isFinite)) {
         throw new Error(`scoreWeights must be finite numbers, got ${config.scoreWeights}`);
@@ -209,10 +267,52 @@ export class VolumeAnomalyDetector {
     // a fixed TIME span (≥ 15–30 min of normal market) so the baselines are
     // stable regardless of pace.
     const allTimestamps = sorted.map((t) => t.timestamp / 1000);
-    const fast = this.rollingRates(sorted, allTimestamps, this.cfg.rateHorizonSec);
-    const slow = this.rollingRates(sorted, allTimestamps, this.cfg.slowHorizonSec);
+    const spanSec = allTimestamps[allTimestamps.length - 1]! - allTimestamps[0]!;
+
+    // ── Horizons chosen on the fly (unless pinned in config).
+    // The config values act as floors; for sparse streams the horizons are
+    // scaled up from the median inter-trade gap so a horizon window carries
+    // ≥ ~25 trades and the "rate" statistic actually measures something.
+    // Both are capped by the training span (the slow horizon needs several
+    // independent stretches inside the baseline to be calibratable).
+    const gaps: number[] = [];
+    for (let i = 1; i < allTimestamps.length; i++) {
+      gaps.push(allTimestamps[i]! - allTimestamps[i - 1]!);
+    }
+    const medianGap = gaps.length > 0 ? quantile(gaps, 50) : 1;
+    let fastHorizonSec = this.explicitFast
+      ? this.cfg.rateHorizonSec
+      : Math.min(
+          Math.max(this.cfg.rateHorizonSec, 25 * medianGap),
+          Math.max(spanSec / 10, this.cfg.rateHorizonSec),
+        );
+    let slowHorizonSec = this.explicitSlow
+      ? this.cfg.slowHorizonSec
+      : Math.min(
+          Math.max(this.cfg.slowHorizonSec, 6 * fastHorizonSec),
+          Math.max(spanSec / 4, this.cfg.slowHorizonSec),
+        );
+    if (slowHorizonSec < fastHorizonSec) slowHorizonSec = fastHorizonSec;
+
+    const fast = this.rollingRates(sorted, allTimestamps, fastHorizonSec);
+    const slow = this.rollingRates(sorted, allTimestamps, slowHorizonSec);
     const rateStats = { fast: robustStats(fast.rates),    slow: robustStats(slow.rates) };
     const volStats  = { fast: robustStats(fast.volRates), slow: robustStats(slow.volRates) };
+
+    // ── Score-mapping calibration from the null distribution: what peak z
+    // does this baseline produce on its own, in alert-sized stretches?
+    const calib = (samples: number[], stats: RobustStats, firstIdx: number): ChannelCalib =>
+      this.calibrateChannel(
+        samples.map((x) => robustZ(x, stats)),
+        firstIdx >= 0 ? allTimestamps.slice(firstIdx) : [],
+        slowHorizonSec,
+      );
+    const channelCalib = {
+      rateFast: calib(fast.rates,    rateStats.fast, fast.firstIdx),
+      volFast:  calib(fast.volRates, volStats.fast,  fast.firstIdx),
+      rateSlow: calib(slow.rates,    rateStats.slow, slow.firstIdx),
+      volSlow:  calib(slow.volRates, volStats.slow,  slow.firstIdx),
+    };
 
     // ── Hawkes: fit to trade arrival times (in seconds).
     // MLE cost grows with n and the fit only needs recent arrival structure —
@@ -288,6 +388,9 @@ export class VolumeAnomalyDetector {
       imbalanceThreshold,
       rateStats,
       volStats,
+      fastHorizonSec,
+      slowHorizonSec,
+      channelCalib,
       lambdaBaseline,
       bocpdNoiseFloor,
     };
@@ -315,7 +418,8 @@ export class VolumeAnomalyDetector {
     const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
     const {
       hawkesParams, cusumParams, bocpdPrior,
-      rateStats, volStats, lambdaBaseline, bocpdNoiseFloor,
+      rateStats, volStats, fastHorizonSec, slowHorizonSec, channelCalib,
+      lambdaBaseline, bocpdNoiseFloor,
     } = this.models;
     const [wH, wC, wB] = this.cfg.scoreWeights;
 
@@ -328,22 +432,30 @@ export class VolumeAnomalyDetector {
     // to concentrate at the fast horizon.  A single trade yields no
     // meaningful rate → channels stay off.
     //
-    // Sigmoid centred at z = 12 with slope 0.4 — calibrated on a full day of
-    // real BTCUSDT aggTrades (see test/eval.test.ts): peak-over-window robust
-    // z of normal windows sits at ≈ 6–7 (P95) while genuine anomalies reach
-    // z ≈ 14–150.  This mapping gives z=3 → 0.03, z=12 → 0.5, z≈14.7 → 0.75
-    // (the default confidence), z=20 → 0.96.
-    // Measured at confidence 0.75: ≈90% of locally-strong (z≥8 vs trailing
-    // hour) buckets and ≈94% of anomaly events detected at ≈2.5% false-alarm
-    // rate on normal buckets.
+    // Each z is mapped to a score through the channel's self-calibrated null
+    // mapping (see ChannelCalib): 0.5 at the P90 of the maxima the baseline
+    // itself produced in alert-sized stretches, 0.75 at their P99.  A window
+    // longer than the calibration stretch gets more independent looks at the
+    // maximum, so the bar rises by one tail unit per decade of extra span
+    // (exponential-tail return-level correction).
     const timestamps = sorted.map((t) => t.timestamp / 1000);
     const lambda     = hawkesPeakLambda(timestamps, hawkesParams);
-    const zSig = (z: number) => 1 / (1 + Math.exp(-(z - 12) * 0.4));
+    const spanSec    = timestamps[timestamps.length - 1]! - timestamps[0]!;
+    const spanShift  = Math.log10(Math.max(1, spanSec / slowHorizonSec));
+    const LN3        = Math.log(3);
+    // Clamped just below 1: with a tight tail unit the sigmoid's exponent can
+    // underflow to exactly 1.0, and a confidence threshold of 1.0 must keep
+    // its "never fires" semantics.
+    const chScore    = (z: number, cal: ChannelCalib) =>
+      Math.min(
+        1 / (1 + Math.exp(-((z - cal.c - cal.u * spanShift) * LN3) / cal.u)),
+        1 - 1e-9,
+      );
 
     let zRate = 0, zVol = 0, zRateSlow = 0, zVolSlow = 0;
     if (timestamps.length >= 2) {
-      const fast = this.rollingRates(sorted, timestamps, this.cfg.rateHorizonSec);
-      const slow = this.rollingRates(sorted, timestamps, this.cfg.slowHorizonSec);
+      const fast = this.rollingRates(sorted, timestamps, fastHorizonSec);
+      const slow = this.rollingRates(sorted, timestamps, slowHorizonSec);
       zRate     = robustZ(Math.max(...fast.rates),    rateStats.fast);
       zVol      = robustZ(Math.max(...fast.volRates), volStats.fast);
       zRateSlow = robustZ(Math.max(...slow.rates),    rateStats.slow);
@@ -354,7 +466,14 @@ export class VolumeAnomalyDetector {
     // correlates with the rate z-channels and only added false-positive tail
     // in the real-data evaluation.
     const lambdaRatio = lambdaBaseline > 0 && Number.isFinite(lambda) ? lambda / lambdaBaseline : 0;
-    const hawkesScore = Math.max(zSig(zRate), zSig(zVol), zSig(zRateSlow), zSig(zVolSlow));
+    const hawkesScore = timestamps.length >= 2
+      ? Math.max(
+          chScore(zRate,     channelCalib.rateFast),
+          chScore(zVol,      channelCalib.volFast),
+          chScore(zRateSlow, channelCalib.rateSlow),
+          chScore(zVolSlow,  channelCalib.volSlow),
+        )
+      : 0;
 
     // ── 2. Current imbalance (full window, signed — for direction reporting)
     const imbalance = volumeImbalance(sorted);
@@ -488,7 +607,7 @@ export class VolumeAnomalyDetector {
     sorted:     IAggregatedTradeData[],
     timestamps: number[],
     horizon:    number,
-  ): { rates: number[]; volRates: number[] } {
+  ): { rates: number[]; volRates: number[]; firstIdx: number } {
     const n = sorted.length;
     const qtyPrefix = new Array<number>(n + 1).fill(0);
     for (let i = 0; i < n; i++) {
@@ -496,12 +615,14 @@ export class VolumeAnomalyDetector {
     }
     const rates:    number[] = [];
     const volRates: number[] = [];
+    let firstIdx = -1; // trade index of the first full-horizon sample
     const t0   = timestamps[0]!;
     const span = timestamps[n - 1]! - t0;
     if (span >= horizon) {
       let j = 0; // two-pointer: first trade inside the window (tᵢ − horizon, tᵢ]
       for (let i = 0; i < n; i++) {
         if (timestamps[i]! - t0 < horizon) continue; // truncated lookback
+        if (firstIdx < 0) firstIdx = i;
         while (timestamps[j]! <= timestamps[i]! - horizon) j++;
         rates.push((i - j + 1) / horizon);
         volRates.push((qtyPrefix[i + 1]! - qtyPrefix[j]!) / horizon);
@@ -511,8 +632,72 @@ export class VolumeAnomalyDetector {
       const dur = Math.max(span, Math.min(1, horizon));
       rates.push(n / dur);
       volRates.push(qtyPrefix[n]! / dur);
+      firstIdx = -1; // single whole-window sample — not aligned to a trade
     }
-    return { rates, volRates };
+    return { rates, volRates, firstIdx };
+  }
+
+  // ─── Score-mapping calibration ──────────────────────────────────────────────
+
+  /**
+   * Build the score mapping for one channel from the null distribution of its
+   * window maxima on the training data.
+   *
+   * The training z-series is cut into sliding stretches of windowSec (the
+   * slow-horizon alert timescale), stepped by windowSec/4; the maximum z of
+   * each stretch is one null sample — "the worst this baseline does in one
+   * alert window".  The mapping anchors on the quantiles of those maxima:
+   * P99 → score 0.5, P99 + (P99−P90) → score 0.75.  No instrument-specific
+   * constants:
+   * a noisy instrument gets a wide mapping, a quiet one a tight mapping, and
+   * a baseline that itself contains recurring bursts absorbs them into its
+   * null quantiles (a repeat of a known pattern scores ≈ 0.5, not 1.0).
+   *
+   * Falls back to the fixed real-data calibration when the training span
+   * yields fewer than 8 stretches.
+   */
+  private calibrateChannel(
+    zSamples:  number[],
+    sampleTs:  number[],
+    windowSec: number,
+  ): ChannelCalib {
+    if (zSamples.length === 0 || zSamples.length !== sampleTs.length) return CALIB_FALLBACK;
+    const step = windowSec / 4;
+    const t0   = sampleTs[0]!;
+    const nBuckets = Math.floor((sampleTs[sampleTs.length - 1]! - t0) / step) + 1;
+    if (nBuckets < 8) return CALIB_FALLBACK;
+
+    // Max per step-bucket, then window max = max of 4 consecutive buckets.
+    const bucketMax = new Array<number>(nBuckets).fill(-Infinity);
+    for (let i = 0; i < zSamples.length; i++) {
+      const b = Math.min(nBuckets - 1, Math.floor((sampleTs[i]! - t0) / step));
+      if (zSamples[i]! > bucketMax[b]!) bucketMax[b] = zSamples[i]!;
+    }
+    const maxima: number[] = [];
+    for (let b = 0; b + 3 < nBuckets; b++) {
+      const m = Math.max(bucketMax[b]!, bucketMax[b + 1]!, bucketMax[b + 2]!, bucketMax[b + 3]!);
+      if (m !== -Infinity) maxima.push(m);
+    }
+    if (maxima.length < 8) return CALIB_FALLBACK;
+
+    const q90 = quantile(maxima, 90);
+    // Only the LEVEL adapts; the tail unit stays universal.  Measured on the
+    // real-data benchmark:
+    //  - the fallback level acts as a FLOOR, not just a fallback — a 15–30 min
+    //    baseline yields only ~10² correlated null stretches, so its upper
+    //    quantiles routinely UNDERestimate the true normal tail, and trusting
+    //    a low estimate raised false alarms;
+    //  - anchoring the level at null P99 (instead of P90) crushed escalating
+    //    events whose baseline was already hot (spike_2 fixture);
+    //  - adapting the tail unit u to the null spread (P99 − P90) exploded on
+    //    event-contaminated baselines (u ≈ 300) and flattened the mapping so
+    //    much that z ≈ 190 scored only ≈ 0.65.
+    // So: quiet baselines get exactly the validated universal mapping; hot or
+    // noisy baselines raise the level, with the universal tail unit on top.
+    return {
+      c: Math.max(q90, CALIB_FALLBACK.c),
+      u: CALIB_FALLBACK.u,
+    };
   }
 
   // ─── Rolling |imbalance| helper ───────────────────────────────────────────

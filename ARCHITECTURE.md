@@ -30,13 +30,19 @@ isBuyerMaker=true → sell aggressor; false → buy aggressor
 { anomaly, confidence[0,1], scores{hawkes,cusum,bocpd}, stats{zRate,zVol,zRateSlow,zVolSlow,lambdaRatio},
   signals[], imbalance[-1,+1], hawkesLambda, cusumStat, runLength }
 
-## Score composition (recalibrated on real data, July 2026)
+## Score composition (recalibrated on real data, July 2026; on-the-fly constants)
 Primary statistic: self-calibrated robust z of rolling rate (trades/s) and
-volume rate (qty/s) over TIME horizons 5 s and 30 s.
+volume rate (qty/s) over TIME horizons (auto: fast = max(5s, 25×median gap),
+slow = 6×fast, both capped by training span; config values = floors, explicit
+values pin them).
 z = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median)).
-score_volume = max over 4 channels of sigmoid((z − 12)·0.4).
+Score mapping per channel chosen at train(): score = σ((z − c − u·spanShift)·ln3/u),
+c = max(P90 of null window-maxima of the baseline itself, universal floor 12),
+u = universal tail unit ln3/0.4 ≈ 2.75, spanShift = log10(span/slowHorizon).
+Level-only adaptation is deliberate (measured): trusting low null quantiles
+raised FP; P99 anchor or adaptive u crushed escalating events (spike_2).
 confidence = 1.0·score_volume + 0·cusum + 0·bocpd  (defaults [1,0,0])
-anomaly = confidence >= threshold (default 0.75 ⇒ fires at z ≈ 14.7).
+anomaly = confidence >= threshold (default 0.75 ⇒ fires at z ≈ c + 2.75).
 
 CUSUM/BOCPD (on rolling |imbalance|) are flow-shift detectors: computed,
 self-calibrated (CUSUM h = max(5σ, 2× training excursion); BOCPD rescaled
