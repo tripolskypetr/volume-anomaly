@@ -207,6 +207,89 @@ export function hawkesPeakLambda(
   return peak;
 }
 
+// ─── Compensator excess (time-rescaling channel) ─────────────────────────────
+
+/**
+ * Rolling "excess events" statistic: for each event i with a full lookback,
+ * compare the OBSERVED count N in (tᵢ − horizon, tᵢ] with the model's
+ * conditional compensator Λ (expected events given history and fitted
+ * self-excitation), as a Poisson-standardized excess:
+ *
+ *   excess(i) = (N − Λ) / √max(Λ, ε)
+ *
+ * Λ(a, b) = μ·(b−a) + (α/β)·[ A(a)·(1 − e^{−β(b−a)}) + Σ_{a<tⱼ≤b}(1 − e^{−β(b−tⱼ)}) ]
+ * where A(a) = Σ_{tⱼ≤a} e^{−β(a−tⱼ)}.
+ *
+ * This is the time-rescaling idea in windowed form: a follow-on cluster that
+ * the fitted kernel already predicts (the decay tail of a burst) has high Λ
+ * and scores LOW; an exogenous escalation the model cannot explain scores
+ * HIGH.  A raw rate z cannot make this distinction.
+ *
+ * Both sums are carried by monotone recursions (the in-window decayed sum via
+ * B(i), the boundary sum via a decayed accumulator on the trailing pointer),
+ * so the whole series is O(n).  Only full-horizon windows are scored — same
+ * contract as the rolling rate statistic; when the array spans less than the
+ * horizon, a single whole-window sample is returned (firstIdx = -1).
+ *
+ * timestamps sorted ascending, in seconds (same unit as params).
+ */
+export function hawkesExcessSeries(
+  timestamps: number[],
+  params:     HawkesParams,
+  horizon:    number,
+): { excess: number[]; firstIdx: number } {
+  const { mu, alpha, beta } = params;
+  const n = timestamps.length;
+  const excess: number[] = [];
+  let firstIdx = -1;
+  if (n < 2 || beta <= 0) return { excess, firstIdx };
+
+  const t0   = timestamps[0]!;
+  const span = timestamps[n - 1]! - t0;
+
+  // B(i) = Σ_{j≤i} e^{−β(tᵢ−tⱼ)}  (includes event i itself)
+  const B = new Array<number>(n);
+  B[0] = 1;
+  for (let i = 1; i < n; i++) {
+    B[i] = 1 + B[i - 1]! * Math.exp(-beta * (timestamps[i]! - timestamps[i - 1]!));
+  }
+
+  const lambdaOf = (a: number, b: number, Aa: number, N: number, Wb: number): number => {
+    const inWin = N - (Wb - Aa * Math.exp(-beta * (b - a)));
+    return mu * (b - a) + (alpha / beta) * (Aa * (1 - Math.exp(-beta * (b - a))) + inWin);
+  };
+
+  if (span >= horizon) {
+    let j = 0;          // first event index with t > a  (a = tᵢ − horizon)
+    let Aa = 0;         // Σ_{t≤a} e^{−β(a−t)}
+    let aPrev = t0;     // time Aa is currently decayed to
+    for (let i = 0; i < n; i++) {
+      if (timestamps[i]! - t0 < horizon) continue;
+      if (firstIdx < 0) firstIdx = i;
+      const b = timestamps[i]!;
+      const a = b - horizon;
+      // advance the boundary accumulator to a: decay, then absorb events ≤ a
+      Aa *= Math.exp(-beta * (a - aPrev));
+      while (j < n && timestamps[j]! <= a) {
+        Aa += Math.exp(-beta * (a - timestamps[j]!));
+        j++;
+      }
+      aPrev = a;
+      const N   = i - j + 1;
+      const lam = lambdaOf(a, b, Aa, N, B[i]!);
+      excess.push((N - lam) / Math.sqrt(Math.max(lam, 1e-9)));
+    }
+  }
+  if (excess.length === 0) {
+    // whole-window fallback (span < horizon): cold start, A(a) = 0
+    const b = timestamps[n - 1]!;
+    const lam = lambdaOf(t0, b, 0, n, B[n - 1]!);
+    excess.push((n - lam) / Math.sqrt(Math.max(lam, 1e-9)));
+    firstIdx = -1;
+  }
+  return { excess, firstIdx };
+}
+
 // ─── Anomaly score from Hawkes ────────────────────────────────────────────────
 
 /**

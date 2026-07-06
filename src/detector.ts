@@ -17,7 +17,7 @@ import type { CusumState }                       from './types.js';
 
 import type { CusumParams } from './math/cusum.js';
 
-import { volumeImbalance, hawkesFit, hawkesPeakLambda } from './math/hawkes.js';
+import { volumeImbalance, hawkesFit, hawkesPeakLambda, hawkesExcessSeries } from './math/hawkes.js';
 import { cusumFit, cusumUpdate, cusumInitState, cusumAnomalyScore }         from './math/cusum.js';
 import { bocpdUpdate, bocpdInitState, bocpdAnomalyScore, defaultPrior }  from './math/bocpd.js';
 
@@ -149,6 +149,21 @@ export interface TrainedModels {
   lambdaBaseline:      number;
   /** Peak BOCPD anomaly score over the training series (noise floor) */
   bocpdNoiseFloor:     number;
+  /**
+   * Compensator-excess channel (time-rescaling statistic at the fast
+   * horizon): robust location/scale + null calibration of hawkesExcessSeries
+   * over the training window.  In theory it distinguishes exogenous
+   * escalation from the decay tail of a burst the fitted kernel explains.
+   * MEASURED (full-day benchmark): it earns no score weight on this data —
+   * the fitted branching is tiny on most baselines (P50 α/β ≈ 0.01), so the
+   * compensator degenerates to Poisson and the statistic to a noisier rate z:
+   * as an additive channel it changed nothing at any floor, and as an FP veto
+   * it was dominated by simply raising the confidence threshold (TP/FP ze
+   * distributions nearly identical).  Exposed in stats.zExcess for research
+   * and for instruments where excitation actually fits.
+   */
+  excessStats:         RobustStats;
+  excessCalib:         ChannelCalib;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -357,6 +372,7 @@ const MODEL_KEYS: readonly (keyof TrainedModels)[] = [
   'hawkesParams', 'cusumParams', 'bocpdPrior', 'imbalanceThreshold',
   'rateStats', 'volStats', 'fastHorizonSec', 'slowHorizonSec',
   'channelCalib', 'lambdaBaseline', 'bocpdNoiseFloor',
+  'excessStats', 'excessCalib',
 ];
 
 /**
@@ -579,6 +595,20 @@ export class VolumeAnomalyDetector {
     // ── Self-calibrated intensity ceiling: peak λ the baseline itself reached.
     const lambdaBaseline = hawkesPeakLambda(hawkesSlice, hawkesParams);
 
+    // ── Compensator-excess channel (time-rescaling statistic, fast horizon):
+    // same self-calibration pipeline as the rate/volume channels — robust
+    // med/MAD of the training excess series, null distribution of its window
+    // maxima.  The excess statistic is already Poisson-standardized, so the
+    // rate-channel fallback floor is a placeholder for short baselines.
+    const excTrain    = hawkesExcessSeries(allTimestamps, hawkesParams, fastHorizonSec);
+    const excessStats = robustStats(excTrain.excess);
+    const excessCalib = this.calibrateChannel(
+      excTrain.excess.map((x) => robustZ(x, excessStats)),
+      excTrain.firstIdx >= 0 ? allTimestamps.slice(excTrain.firstIdx) : [],
+      slowHorizonSec,
+      CALIB_FALLBACK_RATE,
+    );
+
     // ── CUSUM + BOCPD: fit to rolling |imbalance| series from training data.
     // Both detectors operate on absolute imbalance so that buy-side and
     // sell-side pressure are treated symmetrically.
@@ -650,6 +680,8 @@ export class VolumeAnomalyDetector {
       channelCalib,
       lambdaBaseline,
       bocpdNoiseFloor,
+      excessStats,
+      excessCalib,
     };
   }
 
@@ -682,7 +714,7 @@ export class VolumeAnomalyDetector {
     const {
       hawkesParams, cusumParams, bocpdPrior,
       rateStats, volStats, horizonsSec, slowHorizonSec, channelCalib,
-      lambdaBaseline, bocpdNoiseFloor,
+      lambdaBaseline, bocpdNoiseFloor, excessStats,
     } = this.models;
     const [wH, wC, wB] = this.cfg.scoreWeights;
 
@@ -719,7 +751,7 @@ export class VolumeAnomalyDetector {
 
     let zRate = 0, zVol = 0, zRateSlow = 0, zVolSlow = 0;
     let hawkesScore = 0;
-    let moveScore = 0, zVolLong = -Infinity;
+    let moveScore = 0, zVolLong = -Infinity, zExcess = 0;
     // Peak burst window of the winning channel: trade index of the rolling
     // window END whose statistic won the score, plus that channel's horizon.
     let peakIdx = -1, peakHorizonSec = 0;
@@ -770,6 +802,16 @@ export class VolumeAnomalyDetector {
         ? Math.max(tLead, (tLead + Math.max(Number.isFinite(tOther) ? tOther : 0, 0)) / Math.SQRT2)
         : -Infinity;
       hawkesScore = Number.isFinite(combined) ? ratSig(combined) : 0;
+
+      // ── Compensator-excess statistic (time-rescaling channel): observed
+      // arrivals beyond what the fitted self-excitation explains, at the
+      // fast horizon, as a robust z against the training excess series.
+      // Exposed in stats (and the eval dump) for measurement; NOT part of
+      // the combined confidence until the benchmark shows it earns weight.
+      const exc = hawkesExcessSeries(timestamps, hawkesParams, horizonsSec[0]!);
+      if (exc.excess.length > 0) {
+        zExcess = robustZ(arrayMax(exc.excess), excessStats);
+      }
 
       // ── Predictive ranking score (moveScore).
       // Confidence answers "is this an anomaly?" and is optimized for the
@@ -913,7 +955,7 @@ export class VolumeAnomalyDetector {
       anomaly:      combined >= confidence,
       confidence:   combined,
       scores:       { hawkes: hawkesScore, cusum: cusumScore, bocpd: bocpdScore },
-      stats:        { zRate, zVol, zRateSlow, zVolSlow, lambdaRatio, zRates, zVols },
+      stats:        { zRate, zVol, zRateSlow, zVolSlow, lambdaRatio, zRates, zVols, zExcess },
       signals,
       imbalance,
       burstImbalance,
@@ -1102,7 +1144,7 @@ export class VolumeAnomalyDetector {
       anomaly:      false,
       confidence:   0,
       scores:       { hawkes: 0, cusum: 0, bocpd: 0 },
-      stats:        { zRate: 0, zVol: 0, zRateSlow: 0, zVolSlow: 0, lambdaRatio: 0, zRates: [], zVols: [] },
+      stats:        { zRate: 0, zVol: 0, zRateSlow: 0, zVolSlow: 0, lambdaRatio: 0, zRates: [], zVols: [], zExcess: 0 },
       signals:      [],
       imbalance:    0,
       burstImbalance: 0,

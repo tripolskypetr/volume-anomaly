@@ -8,6 +8,7 @@ export {
   hawkesFit,
   hawkesLambda,
   hawkesAnomalyScore,
+  hawkesExcessSeries,
 } from './hawkes.js';
 
 export type { HawkesFitResult } from './hawkes.js';

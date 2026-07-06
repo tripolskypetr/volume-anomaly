@@ -82,6 +82,17 @@ interface DetectionResult {
          */
         zRates: number[];
         zVols: number[];
+        /**
+         * Compensator-excess z (time-rescaling channel): observed arrivals beyond
+         * what the fitted Hawkes self-excitation explains at the fast horizon,
+         * robust-z-scored against the training excess series.  In theory the
+         * decay tail of a burst the model expects scores LOW here while exogenous
+         * escalation scores HIGH; measured on the benchmark day it adds nothing
+         * over the rate/volume channels (fitted branching is near zero on most
+         * baselines, degenerating the statistic to a noisy rate z) — reported for
+         * research, deliberately NOT part of the combined confidence.
+         */
+        zExcess: number;
     };
     /** Per-detector signals that fired */
     signals: AnomalySignal[];
@@ -315,6 +326,21 @@ interface TrainedModels {
     lambdaBaseline: number;
     /** Peak BOCPD anomaly score over the training series (noise floor) */
     bocpdNoiseFloor: number;
+    /**
+     * Compensator-excess channel (time-rescaling statistic at the fast
+     * horizon): robust location/scale + null calibration of hawkesExcessSeries
+     * over the training window.  In theory it distinguishes exogenous
+     * escalation from the decay tail of a burst the fitted kernel explains.
+     * MEASURED (full-day benchmark): it earns no score weight on this data —
+     * the fitted branching is tiny on most baselines (P50 α/β ≈ 0.01), so the
+     * compensator degenerates to Poisson and the statistic to a noisier rate z:
+     * as an additive channel it changed nothing at any floor, and as an FP veto
+     * it was dominated by simply raising the confidence threshold (TP/FP ze
+     * distributions nearly identical).  Exposed in stats.zExcess for research
+     * and for instruments where excitation actually fits.
+     */
+    excessStats: RobustStats;
+    excessCalib: ChannelCalib;
 }
 /** Robust location/scale: median + MAD. */
 interface RobustStats {

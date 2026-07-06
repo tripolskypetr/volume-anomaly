@@ -93,6 +93,17 @@ export interface DetectionResult {
      */
     zRates:      number[];
     zVols:       number[];
+    /**
+     * Compensator-excess z (time-rescaling channel): observed arrivals beyond
+     * what the fitted Hawkes self-excitation explains at the fast horizon,
+     * robust-z-scored against the training excess series.  In theory the
+     * decay tail of a burst the model expects scores LOW here while exogenous
+     * escalation scores HIGH; measured on the benchmark day it adds nothing
+     * over the rate/volume channels (fitted branching is near zero on most
+     * baselines, degenerating the statistic to a noisy rate z) — reported for
+     * research, deliberately NOT part of the combined confidence.
+     */
+    zExcess:     number;
   };
   /** Per-detector signals that fired */
   signals:        AnomalySignal[];

@@ -311,6 +311,8 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
           z: [rc.stats.zRate, rc.stats.zVol, rc.stats.zRateSlow, rc.stats.zVolSlow],
           // full per-scale vectors (one entry per m.horizonsSec)
           zr: rc.stats.zRates, zv2: rc.stats.zVols,
+          // compensator-excess z (time-rescaling channel, fast horizon)
+          ze: rc.stats.zExcess,
         });
         if (e >= end) break;
       }
@@ -332,9 +334,12 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
       //   d1: EW COUNT share at the peak, decay = fitted univariate β
       //   d2: EW QTY share, same decay
       //   d3: bivariate Hawkes excitation share at the peak (full MLE)
-      // Computed lazily — only where a direction would actually be emitted.
+      // Computed lazily — only where a direction would actually be emitted,
+      // and only under EVAL_DIR=1 (the biHawkes MLE adds ~10 min to a sweep;
+      // the 2026-07 verdict: no direction candidate beats chance on forward
+      // returns — re-enable only to re-test that on new data).
       let dd: Record<string, number> | undefined;
-      if (r.anomaly) {
+      if (r.anomaly && process.env['EVAL_DIR'] === '1') {
         const peakSec = r.peakTs / 1000;
         const beta    = m.hawkesParams.beta;
         const from    = Math.max(histLo, fi - 200);
@@ -480,9 +485,10 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
 
     // ── Direction benchmark: among flagged buckets, does the emitted side
     // agree with the sign of the forward return?
+    const flaggedRows = rows.filter((r2) => r2['dd'] !== undefined) as Array<{ dd: Record<string, number>; fr1: number; fr5: number }>;
+    if (flaggedRows.length > 0) {
     console.log('');
     console.log('── direction (sign of forward return on flagged buckets) ──');
-    const flaggedRows = rows.filter((r2) => r2['dd'] !== undefined) as Array<{ dd: Record<string, number>; fr1: number; fr5: number }>;
     for (const [key, hz] of [['fr1', '1min'], ['fr5', '5min']] as const) {
       for (const cand of ['d0', 'd1', 'd2', 'd3'] as const) {
         const ok = flaggedRows.filter((r2) => Number.isFinite(r2[key]) && r2[key] !== 0);
@@ -500,6 +506,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
           `   thresholded ${nT ? ((100 * hitT) / nT).toFixed(1) : '—'}% (n=${nT})`,
         );
       }
+    }
     }
 
     const dumpPath = process.env['EVAL_DUMP'];
