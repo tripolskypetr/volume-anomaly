@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname }         from 'node:path';
 import { fileURLToPath }         from 'node:url';
 import { VolumeAnomalyDetector } from '../src/index.js';
+import { biHawkesFit, biExcitationShare } from '../src/math/index.js';
 import type { IAggregatedTradeData } from '../src/index.js';
 
 const RUN = process.env['EVAL'] === '1';
@@ -167,6 +168,16 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         fwdR[k]![b] = h > l && close[b]! > 0 ? (h - l) / close[b]! : 0;
       }
     }
+    // Signed forward log-return (direction ground truth): does price end
+    // HIGHER or LOWER K buckets after this one.
+    const fwdRet = FWD_HORIZONS.map(() => new Array<number>(nBuckets).fill(NaN));
+    for (let k = 0; k < FWD_HORIZONS.length; k++) {
+      const K = FWD_HORIZONS[k]!;
+      for (let b = 0; b + K < nBuckets; b++) {
+        if (close[b]! > 0 && close[b + K]! > 0) fwdRet[k]![b] = Math.log(close[b + K]! / close[b]!);
+      }
+    }
+
     const TRAIL_FWD = 120;
     const fwdZ = FWD_HORIZONS.map(() => new Array<number>(nBuckets).fill(NaN));
     for (let k = 0; k < FWD_HORIZONS.length; k++) {
@@ -315,12 +326,48 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
       }
       const retBps = close[b]! > 0 && open[b]! > 0 ? Math.abs(Math.log(close[b]! / open[b]!)) * 1e4 : 0;
       pred.push({ b, lab, conf: r.confidence, anomaly: r.anomaly, ret: retBps, move });
+
+      // ── Direction candidates for flagged buckets (dir GT = sign(fwdRet)).
+      //   d0: burstImbalance (shipped: hard peak window, qty, Kish-shrunk)
+      //   d1: EW COUNT share at the peak, decay = fitted univariate β
+      //   d2: EW QTY share, same decay
+      //   d3: bivariate Hawkes excitation share at the peak (full MLE)
+      // Computed lazily — only where a direction would actually be emitted.
+      let dd: Record<string, number> | undefined;
+      if (r.anomaly) {
+        const peakSec = r.peakTs / 1000;
+        const beta    = m.hawkesParams.beta;
+        const from    = Math.max(histLo, fi - 200);
+        let n1 = 0, w1 = 0, n2 = 0, w2 = 0;
+        const times: number[] = [];
+        const isBuy: boolean[] = [];
+        for (let i = from; i < end && c.ts[i]! / 1000 <= peakSec + 1e-9; i++) {
+          const tSec = c.ts[i]! / 1000;
+          const w    = Math.exp(-Math.min(700, beta * (peakSec - tSec)));
+          const sgn  = c.maker[i] === 1 ? -1 : 1; // maker=1 → sell aggressor
+          n1 += sgn * w;        w1 += w;
+          n2 += sgn * w * c.qty[i]!; w2 += w * c.qty[i]!;
+          if (i >= fi - 200) { times.push(tSec); isBuy.push(c.maker[i] !== 1); }
+        }
+        const bi = biHawkesFit(makeWindow(c, Math.max(histLo, fi - 1200), fi), 300);
+        dd = {
+          d0: r.burstImbalance,
+          d1: w1 > 0 ? n1 / w1 : 0,
+          d2: w2 > 0 ? n2 / w2 : 0,
+          d3: biExcitationShare(times, isBuy, peakSec, bi.params),
+          thr: Math.max(0, m.imbalanceThreshold),
+          biB: bi.branching,
+        };
+      }
       rows.push({
         b, lab,
         h: r.scores.hawkes, c: r.scores.cusum, p: r.scores.bocpd,
         rr, vr, zv: zVol[b]!, zc: zCnt[b]!,
         // forward price response (predictive GT): z of forward 1min/5min range
         fz1: fwdZ[0]![b]!, fz5: fwdZ[1]![b]!,
+        // signed forward log-returns (direction GT) + direction candidates
+        fr1: fwdRet[0]![b]!, fr5: fwdRet[1]![b]!,
+        dd,
         // current-bucket |return| in bps — the naive momentum baseline
         ret: retBps,
         calls,
@@ -427,6 +474,30 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
           `fwd ${horizon} z≥${THR}: base rate ${(100 * nMoved / zs.length).toFixed(1)}%  ` +
           `P(move|anomaly)=${(100 * pMovedGivenAnomaly).toFixed(1)}%  ` +
           `AUC conf=${aucConf.toFixed(3)}  AUC moveScore=${aucMove.toFixed(3)}  AUC gtZ=${aucGt.toFixed(3)}  AUC |ret|=${aucRet.toFixed(3)}`,
+        );
+      }
+    }
+
+    // ── Direction benchmark: among flagged buckets, does the emitted side
+    // agree with the sign of the forward return?
+    console.log('');
+    console.log('── direction (sign of forward return on flagged buckets) ──');
+    const flaggedRows = rows.filter((r2) => r2['dd'] !== undefined) as Array<{ dd: Record<string, number>; fr1: number; fr5: number }>;
+    for (const [key, hz] of [['fr1', '1min'], ['fr5', '5min']] as const) {
+      for (const cand of ['d0', 'd1', 'd2', 'd3'] as const) {
+        const ok = flaggedRows.filter((r2) => Number.isFinite(r2[key]) && r2[key] !== 0);
+        // thresholded (like predict): signal beyond ±thr for d0; ±0.2 for others
+        let hitT = 0, nT = 0, hit0 = 0, n0 = 0;
+        for (const r2 of ok) {
+          const v = r2.dd[cand]!;
+          const gt = Math.sign(r2[key]);
+          if (v !== 0) { n0++; if (Math.sign(v) === gt) hit0++; }
+          const thr = cand === 'd0' ? r2.dd['thr']! : 0.2;
+          if (Math.abs(v) > thr) { nT++; if (Math.sign(v) === gt) hitT++; }
+        }
+        console.log(
+          `${hz} ${cand}: sign hit ${n0 ? ((100 * hit0) / n0).toFixed(1) : '—'}% (n=${n0})` +
+          `   thresholded ${nT ? ((100 * hitT) / nT).toFixed(1) : '—'}% (n=${nT})`,
         );
       }
     }

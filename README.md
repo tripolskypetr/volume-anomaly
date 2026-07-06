@@ -126,6 +126,8 @@ Direction reads the **burst-local** imbalance — the order flow inside the roll
 
 On a neutral/balanced market `thr` will be near 0 (most windows have close-to-zero imbalance, p75 ≈ 0.1–0.2). On a trending market the p75 shifts upward with the trend, so the bar for `direction=long` rises accordingly — preventing chronic false long signals during a bull run where sustained buy imbalance is normal, not anomalous. The threshold is clamped at zero, so `'long'` always implies buy-side burst flow and `'short'` sell-side.
 
+> ⚠️ **`direction` is descriptive, not predictive.** It identifies which side *drove* the burst — essential for interpreting the event — but measured on the full-day benchmark, no flow-direction statistic (hard-window imbalance, exponentially-weighted flow, or a full bivariate buy/sell Hawkes excitation model — all evaluated) predicted the *sign* of the forward 1–5 minute return better than chance (~50% hit rate): the price impact of aggressive flow is contemporaneous, and by detection time it is already in the price. Use `direction` to understand the event and `moveScore` to rank expected follow-through *magnitude*; do not trade the direction sign blindly. The bivariate Hawkes model remains available for research via the math exports (`biHawkesFit`, `biExcitationShare`).
+
 **Returns:** `PredictionResult`
 
 ```typescript

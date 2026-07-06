@@ -32,5 +32,14 @@ export {
 
 export type { BocpdState, BocpdUpdateResult, NormalGammaPrior } from './bocpd.js';
 
+export {
+  biHawkesFit,
+  biHawkesLogLikelihood,
+  biExcitationShare,
+  biBranching,
+} from './bihawkes.js';
+
+export type { BiHawkesParams, BiHawkesFitResult } from './bihawkes.js';
+
 export { nelderMead } from './optimizer.js';
 export type { NMResult } from './optimizer.js';
