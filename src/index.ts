@@ -19,7 +19,7 @@
  */
 
 export { VolumeAnomalyDetector } from './detector.js';
-export type { DetectorConfig }   from './detector.js';
+export type { DetectorConfig, DetectorSnapshot, TrainedModels } from './detector.js';
 
 export type {
   IAggregatedTradeData,

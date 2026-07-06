@@ -91,7 +91,7 @@ const DEFAULTS: Required<DetectorConfig> = {
 
 // ─── Trained model bundle ─────────────────────────────────────────────────────
 
-interface TrainedModels {
+export interface TrainedModels {
   hawkesParams:        HawkesParams;
   cusumParams:         CusumParams;
   bocpdPrior:          NormalGammaPrior;
@@ -250,6 +250,71 @@ interface ChannelCalib {
 const CALIB_FALLBACK_RATE: ChannelCalib = { c: 14,  u: 5.5, nullQ: [] };
 const CALIB_FALLBACK_VOL:  ChannelCalib = { c: 6.5, u: 5.5, nullQ: [] };
 
+// ─── Serialization ────────────────────────────────────────────────────────────
+
+/**
+ * JSON-friendly snapshot of a detector: configuration + trained models.
+ * Produced by toJSON() (and therefore by JSON.stringify(detector)); consumed
+ * by VolumeAnomalyDetector.fromJSON().  Every value is a plain finite number
+ * or boolean, so the snapshot survives a JSON round-trip losslessly.
+ */
+export interface DetectorSnapshot {
+  /** Snapshot format version; current writers emit 1 */
+  version:      number;
+  config:       Required<DetectorConfig>;
+  /** Whether the fast/slow horizons were pinned explicitly (vs auto-chosen) */
+  explicitFast: boolean;
+  explicitSlow: boolean;
+  models:       TrainedModels | null;
+}
+
+/**
+ * Deep copy for snapshot payloads.  Trained models are plain trees of finite
+ * numbers, so a JSON round-trip is lossless here — and it stays inside the
+ * "lib": ["ES2022"] surface (no structuredClone dependency).
+ */
+function deepClone<T>(x: T): T {
+  return JSON.parse(JSON.stringify(x)) as T;
+}
+
+/** Top-level keys a serialized TrainedModels must carry. */
+const MODEL_KEYS: readonly (keyof TrainedModels)[] = [
+  'hawkesParams', 'cusumParams', 'bocpdPrior', 'imbalanceThreshold',
+  'rateStats', 'volStats', 'fastHorizonSec', 'slowHorizonSec',
+  'channelCalib', 'lambdaBaseline', 'bocpdNoiseFloor',
+];
+
+/**
+ * Structural validation for deserialized models: all top-level keys present
+ * and every leaf a finite number.  JSON.stringify silently turns NaN/Infinity
+ * into null, so a corrupted or hand-edited snapshot surfaces here with a
+ * path in the message instead of as NaN confidence deep inside detect().
+ */
+function assertModelShape(models: unknown): asserts models is TrainedModels {
+  if (models === null || typeof models !== 'object' || Array.isArray(models)) {
+    throw new Error('snapshot.models must be an object or null');
+  }
+  for (const key of MODEL_KEYS) {
+    if (!(key in models)) throw new Error(`snapshot.models.${key} is missing`);
+  }
+  const walk = (v: unknown, path: string): void => {
+    if (typeof v === 'number') {
+      if (!Number.isFinite(v)) throw new Error(`snapshot.models: non-finite number at ${path}`);
+      return;
+    }
+    if (Array.isArray(v)) {
+      v.forEach((x, i) => walk(x, `${path}[${i}]`));
+      return;
+    }
+    if (v !== null && typeof v === 'object') {
+      for (const [k, x] of Object.entries(v)) walk(x, `${path}.${k}`);
+      return;
+    }
+    throw new Error(`snapshot.models: unexpected ${v === null ? 'null' : typeof v} at ${path}`);
+  };
+  walk(models, 'models');
+}
+
 // ─── Detector class ───────────────────────────────────────────────────────────
 
 export class VolumeAnomalyDetector {
@@ -275,6 +340,47 @@ export class VolumeAnomalyDetector {
         throw new Error(`scoreWeights must sum to 1, got ${sum}`);
       }
     }
+
+    // Numeric config options: a bad value here never crashes — it silently
+    // produces a miscalibrated or dead detector (e.g. hazardLambda ≤ 1 makes
+    // H = 1/λ ≥ 1, log(1 − H) = −∞/NaN, and the BOCPD run-length state
+    // collapses to empty on the first update) — so reject it loudly instead.
+    const check = (name: string, v: number, ok: boolean, expected: string) => {
+      if (!ok) throw new Error(`${name} must be ${expected}, got ${v}`);
+    };
+    const { windowSize, hazardLambda, cusumKSigmas, cusumHSigmas,
+            rateHorizonSec, slowHorizonSec, imbalancePercentile } = this.cfg;
+    check('windowSize',     windowSize,     Number.isInteger(windowSize) && windowSize >= 1, 'an integer >= 1');
+    check('hazardLambda',   hazardLambda,   Number.isFinite(hazardLambda) && hazardLambda > 1, 'a finite number > 1');
+    check('cusumKSigmas',   cusumKSigmas,   Number.isFinite(cusumKSigmas) && cusumKSigmas > 0, 'a finite number > 0');
+    check('cusumHSigmas',   cusumHSigmas,   Number.isFinite(cusumHSigmas) && cusumHSigmas > 0, 'a finite number > 0');
+    check('rateHorizonSec', rateHorizonSec, Number.isFinite(rateHorizonSec) && rateHorizonSec > 0, 'a finite number > 0');
+    check('slowHorizonSec', slowHorizonSec, Number.isFinite(slowHorizonSec) && slowHorizonSec > 0, 'a finite number > 0');
+    check('imbalancePercentile', imbalancePercentile,
+      Number.isFinite(imbalancePercentile) && imbalancePercentile >= 0 && imbalancePercentile <= 100,
+      'a finite number in [0, 100]');
+  }
+
+  /**
+   * trades[].timestamp must be Unix MILLISECONDS.  A wrong unit never crashes —
+   * it silently rescales every time horizon 1000× (the most damaging
+   * integration mistake possible) — so the two real-world mix-ups are rejected
+   * here.  Only epoch-like values can be judged; relative/synthetic timestamps
+   * (small values) pass through untouched:
+   *   epoch seconds  ~1.7e9  → falls in [1e8, 1e11)   (as ms: early 1970s)
+   *   epoch µs       ~1.7e15 → exceeds 1e14           (as ms: year 5138+)
+   */
+  private static assertMillis(t0: number): void {
+    if (t0 >= 1e8 && t0 < 1e11) {
+      throw new Error(
+        `timestamps look like Unix SECONDS (first = ${t0}); timestamp must be in milliseconds`,
+      );
+    }
+    if (t0 >= 1e14) {
+      throw new Error(
+        `timestamps look like Unix MICROseconds (first = ${t0}); timestamp must be in milliseconds`,
+      );
+    }
   }
 
   // ─── Training ───────────────────────────────────────────────────────────────
@@ -290,6 +396,7 @@ export class VolumeAnomalyDetector {
 
     // Sort by time
     const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
+    VolumeAnomalyDetector.assertMillis(sorted[0]!.timestamp);
 
     // ── Self-calibrated rate baselines: robust median/MAD of the rolling
     // arrival rate (events/s) and rolling volume rate (qty/s) at both time
@@ -457,11 +564,17 @@ export class VolumeAnomalyDetector {
     if (!this.models) {
       throw new Error('Call train() before detect()');
     }
+    // !(…) also catches NaN.  The most common real mistake is percent instead
+    // of a fraction (75 for 0.75) — anomaly would then silently never fire.
+    if (!(confidence >= 0 && confidence <= 1)) {
+      throw new Error(`confidence must be in [0, 1], got ${confidence}`);
+    }
     if (trades.length === 0) {
       return this.emptyResult();
     }
 
     const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
+    VolumeAnomalyDetector.assertMillis(sorted[0]!.timestamp);
     const {
       hawkesParams, cusumParams, bocpdPrior,
       rateStats, volStats, fastHorizonSec, slowHorizonSec, channelCalib,
@@ -789,6 +902,58 @@ export class VolumeAnomalyDetector {
       cusumStat:    0,
       runLength:    0,
     };
+  }
+
+  // ─── Serialization ──────────────────────────────────────────────────────────
+
+  /**
+   * Snapshot of configuration + trained models (deep-copied — mutating the
+   * result cannot poison the detector).  Called automatically by
+   * JSON.stringify(detector).  Restore with VolumeAnomalyDetector.fromJSON():
+   * train once (e.g. in a worker on a schedule), serialize, detect anywhere
+   * else without re-training.
+   */
+  toJSON(): DetectorSnapshot {
+    return {
+      version:      1,
+      config:       { ...this.cfg, scoreWeights: [...this.cfg.scoreWeights] },
+      explicitFast: this.explicitFast,
+      explicitSlow: this.explicitSlow,
+      models:       this.models && deepClone(this.models),
+    };
+  }
+
+  /**
+   * Reconstruct a detector from a toJSON() snapshot (object or JSON string).
+   * The snapshot is validated structurally — config through the constructor,
+   * models leaf-by-leaf — so corrupted or hand-edited state fails loudly here
+   * rather than as NaN confidence inside detect().
+   */
+  static fromJSON(snapshot: DetectorSnapshot | string): VolumeAnomalyDetector {
+    const s = (typeof snapshot === 'string'
+      ? JSON.parse(snapshot)
+      : snapshot) as DetectorSnapshot;
+    if (s === null || typeof s !== 'object') {
+      throw new Error('snapshot must be an object or a JSON string');
+    }
+    if (s.version !== 1) {
+      throw new Error(`unsupported snapshot version: ${s.version}`);
+    }
+    if (s.config === null || typeof s.config !== 'object') {
+      throw new Error('snapshot.config is missing');
+    }
+    // Auto-chosen horizons must stay auto after restore: the constructor
+    // derives the explicit-pin flags from key presence, so drop the keys that
+    // were filled from DEFAULTS rather than by the user.
+    const cfg: DetectorConfig = { ...s.config };
+    if (!s.explicitFast) delete cfg.rateHorizonSec;
+    if (!s.explicitSlow) delete cfg.slowHorizonSec;
+    const det = new VolumeAnomalyDetector(cfg); // re-runs config validation
+    if (s.models !== null && s.models !== undefined) {
+      assertModelShape(s.models);
+      det.models = deepClone(s.models);
+    }
+    return det;
   }
 
   // ─── Introspection ────────────────────────────────────────────────────────
