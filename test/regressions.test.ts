@@ -261,8 +261,10 @@ describe('predict() direction: sell-biased training does not flip long/short', (
     expect(r.direction).toBe('long');
   });
 
-  it('direction always matches the imbalance sign', () => {
-    // Property pinned by the clamp: 'long' ⇒ imbalance > 0, 'short' ⇒ < 0.
+  it('direction always matches the burst-imbalance sign', () => {
+    // Property pinned by the clamp: 'long' ⇒ burstImbalance > 0, 'short' ⇒ < 0.
+    // direction reads the burst-local imbalance (the full-window `imbalance`
+    // dilutes a burst's onset with surrounding two-way flow).
     const histories = [
       makeBiased(500, 0, 7),          // sell-heavy
       makeBiased(500, 0, 2),          // balanced
@@ -276,8 +278,8 @@ describe('predict() direction: sell-biased training does not flip long/short', (
     for (const hist of histories) {
       for (const rec of recents) {
         const r = predict(hist, rec, 0.0);
-        if (r.direction === 'long')  expect(r.imbalance).toBeGreaterThan(0);
-        if (r.direction === 'short') expect(r.imbalance).toBeLessThan(0);
+        if (r.direction === 'long')  expect(r.burstImbalance).toBeGreaterThan(0);
+        if (r.direction === 'short') expect(r.burstImbalance).toBeLessThan(0);
       }
     }
   });

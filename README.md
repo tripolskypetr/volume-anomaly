@@ -86,17 +86,18 @@ interface DetectionResult {
 
 ### `predict(historical, recent, confidence?, imbalanceThreshold?)`
 
-One-shot convenience function. Wraps `detect()` and adds a directional signal derived from `imbalance`.
+One-shot convenience function. Wraps `detect()` and adds a directional signal derived from the **burst-local** order flow.
 
 ```typescript
 import { predict } from 'volume-anomaly';
 
 const result = predict(historical, recent, 0.75, 0.3);
 // {
-//   anomaly:    true,
-//   confidence: 0.81,
-//   direction:  'long',    // 'long' | 'short' | 'neutral'
-//   imbalance:  0.72,
+//   anomaly:        true,
+//   confidence:     0.81,
+//   direction:      'long',    // 'long' | 'short' | 'neutral'
+//   imbalance:      0.42,      // full-window flow balance
+//   burstImbalance: 0.72,      // flow balance INSIDE the peak burst window
 // }
 ```
 
@@ -112,24 +113,27 @@ const result = predict(historical, recent, 0.75, 0.3);
 **Direction logic:**
 
 ```
-thr = imbalanceThreshold  (if provided explicitly)
-    = detector.trainedModels.imbalanceThreshold  (otherwise — p75 from training)
+thr = max(0, imbalanceThreshold)  (if provided explicitly)
+    = max(0, detector.trainedModels.imbalanceThreshold)  (otherwise — p75 from training)
 
-direction = 'long'    if anomaly && imbalance >  +thr
-direction = 'short'   if anomaly && imbalance < −thr
-direction = 'neutral' otherwise (no anomaly, or balanced flow)
+direction = 'long'    if anomaly && burstImbalance >  +thr
+direction = 'short'   if anomaly && burstImbalance < −thr
+direction = 'neutral' otherwise (no anomaly, or balanced flow at the burst)
 ```
 
-On a neutral/balanced market `thr` will be near 0 (most windows have close-to-zero imbalance, p75 ≈ 0.1–0.2). On a trending market the p75 shifts upward with the trend, so the bar for `direction=long` rises accordingly — preventing chronic false long signals during a bull run where sustained buy imbalance is normal, not anomalous.
+Direction reads the **burst-local** imbalance — the order flow inside the rolling window that actually produced the anomaly score — not the full-window average, which dilutes a burst's onset with surrounding two-way flow (measured on real data: a pure sell burst reads −0.9 at the burst but only −0.42 over the full bucket). The burst imbalance is additionally shrunk toward neutral by effective sample size (Kish n_eff over qty), so a three-trade or single-whale "burst" cannot fake directional conviction.
+
+On a neutral/balanced market `thr` will be near 0 (most windows have close-to-zero imbalance, p75 ≈ 0.1–0.2). On a trending market the p75 shifts upward with the trend, so the bar for `direction=long` rises accordingly — preventing chronic false long signals during a bull run where sustained buy imbalance is normal, not anomalous. The threshold is clamped at zero, so `'long'` always implies buy-side burst flow and `'short'` sell-side.
 
 **Returns:** `PredictionResult`
 
 ```typescript
 interface PredictionResult {
-  anomaly:    boolean;    // confidence >= threshold
-  confidence: number;     // composite score [0,1]
-  direction:  Direction;  // 'long' | 'short' | 'neutral'
-  imbalance:  number;     // buy/sell balance [-1, +1]
+  anomaly:        boolean;    // confidence >= threshold
+  confidence:     number;     // composite score [0,1]
+  direction:      Direction;  // 'long' | 'short' | 'neutral'
+  imbalance:      number;     // full-window buy/sell balance [-1, +1]
+  burstImbalance: number;     // buy/sell balance inside the peak burst window
 }
 ```
 
@@ -245,17 +249,23 @@ score_final = w_H · score_volume + w_C · score_cusum + w_B · score_bocpd
 anomaly     = score_final >= confidence
 ```
 
-The volume-channel score is a sigmoid over the peak robust z of the rolling rate/volume statistics: `score = σ((z − c) · ln3/u)`. The level `c` is chosen **on the fly at `train()` time**: P85 of the peak-z values the baseline itself produced in alert-sized stretches, floored by per-channel universal levels found by dense brute-force search on a full day of real BTCUSDT trades (`test/eval.test.ts`): 14 for arrival-rate channels, 6.5 for volume channels (volume z separates anomalies much more cleanly, so it earns a lower bar). The tail unit `u = 5.5` is universal in z-space. On a typical baseline `confidence = 0.75` fires at volume z ≥ 12 or rate z ≥ 19.5; a hotter/noisier baseline automatically raises the bar.
+The volume-channel score is built in three steps:
+
+1. **Multi-scale scan.** The peak rolling arrival rate and volume rate are measured at every horizon in the trained family (fast ≈ 5 s, a geometric-mean mid scale, slow ≈ 30 s, and an extended scale up to 3× slow when the training span allows) and standardized per channel: `t = (z − c − u·spanShift) / u`, where `z` is the robust z of the peak against the training median/MAD.
+2. **Cross-type corroboration (Stouffer).** The best arrival-rate `t` and the best volume `t` combine as `max(t_lead, (t_lead + max(t_other, 0)) / √2)`: a moderate rate excess AND a moderate volume excess together outrank either alone. Scales of the *same* type never corroborate each other — they see the same wiggle at different bandwidths.
+3. **Rational sigmoid.** `score = 0.5 + 0.5·t/(1+|t|)`: 0.5 at the calibrated level, 0.75 one tail unit beyond it, approaching 1 harmonically — the top of the scale keeps *ranking* extreme events instead of saturating into ties, which matters when the score is used predictively.
+
+The level `c` is chosen **on the fly at `train()` time**: the P85 of the peak-z values the baseline itself produced in alert-sized stretches, made robust to events inside the training window by a Gumbel fit to the LEFT quantiles of those maxima (contamination inflates only the upper quantiles; the level is `min(empirical P85, Gumbel-extrapolated P85)`), and floored by per-channel universal levels found by dense brute-force search on a full day of real BTCUSDT trades (`test/eval.test.ts`): 14 for arrival-rate channels, 6.5 for volume channels (volume z separates anomalies much more cleanly, so it earns a lower bar). The tail unit `u = 5.5` is universal in z-space. On a typical baseline `confidence = 0.75` fires at volume z ≥ 12 or rate z ≥ 19.5; a hotter/noisier baseline automatically raises the bar.
 
 **Practical guidance** (measured on the real-data benchmark, 30 s buckets):
 
-| `confidence` | Fires at (vol / rate z) | Recall (strong anomalies) | False alarms (normal buckets) |
-|-------------|--------------------------|---------------------------|-------------------------------|
-| `0.5` | ≥ 6.5 / 14 | higher | higher |
-| `0.75` (default) | ≥ 12 / 19.5 | ≈ 92 % (events ≈ 95 %) | ≈ 2.5 % |
-| `0.9` | ≥ 17.5 / 25 | lower | ≈ 1.5 % |
+| `confidence` | Fires at (t units beyond level) | Recall (strong anomalies) | False alarms (normal buckets) |
+|-------------|----------------------------------|---------------------------|-------------------------------|
+| `0.5` | t ≥ 0 (vol z ≥ 6.5 / rate z ≥ 14) | higher | higher |
+| `0.75` (default) | t ≥ 1 (vol z ≥ 12 / rate z ≥ 19.5) | ≈ 96 % (events ≈ 97 %) | ≈ 3.2 % |
+| `0.9` | t ≥ 4 (vol z ≥ 28.5 / rate z ≥ 36) | lower | lower |
 
-A result with `confidence = 0.74` at a threshold of `0.75` means the moment is borderline — the peak volume/rate sits just under one tail unit beyond the calibrated level.
+A result with `confidence = 0.74` at a threshold of `0.75` means the moment is borderline — the combined statistic sits just under one tail unit beyond the calibrated level.
 
 ---
 

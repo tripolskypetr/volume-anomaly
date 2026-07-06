@@ -89,16 +89,23 @@ export function predict(
     imbalanceThreshold ?? detector.trainedModels!.imbalanceThreshold,
   );
 
+  // Direction reads the BURST-local imbalance, not the full-window one: a
+  // burst's onset direction gets diluted by surrounding two-way flow when
+  // averaged over the whole window (measured on real data: −0.42 full-window
+  // vs −0.9 at the burst).  burstImbalance is already shrunk by effective
+  // sample size toward the training flow balance, so a few-trade window
+  // cannot fake conviction.
   let direction: Direction = 'neutral';
   if (r.anomaly) {
-    if (r.imbalance >  thr) direction = 'long';
-    else if (r.imbalance < -thr) direction = 'short';
+    if (r.burstImbalance >  thr) direction = 'long';
+    else if (r.burstImbalance < -thr) direction = 'short';
   }
 
   return {
-    anomaly:    r.anomaly,
-    confidence: r.confidence,
+    anomaly:        r.anomaly,
+    confidence:     r.confidence,
     direction,
-    imbalance:  r.imbalance,
+    imbalance:      r.imbalance,
+    burstImbalance: r.burstImbalance,
   };
 }

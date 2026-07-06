@@ -179,8 +179,8 @@ describe('fromJSON rejects corrupted snapshots', () => {
     // JSON.stringify(Infinity) === 'null' — simulate a snapshot written by a
     // buggy producer.
     const s = JSON.parse(JSON.stringify(validSnap())) as DetectorSnapshot;
-    (s.models!.rateStats.fast as { med: number | null }).med = null;
-    expect(() => VolumeAnomalyDetector.fromJSON(s)).toThrow('rateStats.fast.med');
+    (s.models!.rateStats[0] as { med: number | null }).med = null;
+    expect(() => VolumeAnomalyDetector.fromJSON(s)).toThrow('rateStats[0].med');
   });
 
   it('invalid config in snapshot is rejected by constructor validation', () => {

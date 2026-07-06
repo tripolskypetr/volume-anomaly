@@ -30,8 +30,14 @@ interface PredictionResult {
      * override) is clamped at zero before the symmetric ± comparison.
      */
     direction: Direction;
-    /** Signed imbalance [-1,+1]. Positive = buy-side pressure. */
+    /** Signed imbalance [-1,+1] over the full window. Positive = buy-side pressure. */
     imbalance: number;
+    /**
+     * Imbalance inside the peak burst window (see DetectionResult.burstImbalance).
+     * `direction` is derived from THIS value — the full-window `imbalance`
+     * dilutes a burst's onset direction with surrounding two-way flow.
+     */
+    burstImbalance: number;
 }
 type AnomalyKind = 'volume_spike' | 'imbalance_shift' | 'cusum_alarm' | 'bocpd_changepoint';
 interface AnomalySignal {
@@ -67,11 +73,36 @@ interface DetectionResult {
         zRateSlow: number;
         zVolSlow: number;
         lambdaRatio: number;
+        /**
+         * Per-scale peak robust z, one entry per trained horizon
+         * (TrainedModels.horizonsSec, ascending).  zRate/zVol/zRateSlow/zVolSlow
+         * above are the fastest/slow entries of these, kept for compatibility.
+         */
+        zRates: number[];
+        zVols: number[];
     };
     /** Per-detector signals that fired */
     signals: AnomalySignal[];
     /** Estimated imbalance [-1,+1]: positive = buy pressure */
     imbalance: number;
+    /**
+     * Order-flow imbalance [-1,+1] measured INSIDE the peak burst window (the
+     * rolling window that produced the winning volume/rate channel), not over
+     * the whole detection window — a burst's onset direction gets diluted by
+     * surrounding two-way flow.  Shrunk toward the training buy/sell balance by
+     * effective sample size (Kish n_eff over qty), so a few-trade or one-whale
+     * window carries little directional weight.  Falls back to the shrunk
+     * full-window imbalance when no channel produced a trade-aligned peak.
+     * predict() derives `direction` from this field.
+     */
+    burstImbalance: number;
+    /**
+     * Timestamp (ms) of the last trade of the peak burst window — when the
+     * anomaly actually peaked inside the detection window.  Last trade of the
+     * window when no channel produced a trade-aligned peak; 0 for an empty
+     * window.
+     */
+    peakTs: number;
     /** Peak Hawkes conditional intensity λ(tᵢ) seen across all trades in the detection window */
     hawkesLambda: number;
     /** CUSUM statistic (+ side) at last observation */
@@ -237,35 +268,35 @@ interface TrainedModels {
      */
     /**
      * Robust location/scale of the rolling arrival rate (events/s) and rolling
-     * volume rate (qty/s), per horizon.  detect() scores its peak rolling rate
-     * as a robust z against these: z = (peak − med) / (1.4826 · MAD).
-     * "fast" = brief bursts, "slow" = sustained volume waves spread too evenly
-     * to concentrate at the fast horizon.
+     * volume rate (qty/s), one entry per horizon in `horizonsSec`.  detect()
+     * scores its peak rolling rate at each scale as a robust z against these:
+     * z = (peak − med) / (1.4826 · MAD).  Short horizons catch brief bursts,
+     * long ones sustained volume waves spread too evenly to concentrate at the
+     * short scales.
      */
-    rateStats: {
-        fast: RobustStats;
-        slow: RobustStats;
-    };
-    volStats: {
-        fast: RobustStats;
-        slow: RobustStats;
-    };
+    rateStats: RobustStats[];
+    volStats: RobustStats[];
     /**
-     * Effective horizons chosen at train() time (seconds).  Equal to the config
-     * values when pinned explicitly; otherwise scaled up on the fly for sparse
-     * streams so a horizon window contains enough trades to carry a rate.
+     * Multi-scale horizon family chosen at train() time (seconds, ascending):
+     * fast, an optional geometric-mean mid scale, slow, and an optional
+     * extended scale (up to 3× slow, capped by the training span).  Fast/slow
+     * equal the config values when pinned explicitly; otherwise scaled up on
+     * the fly for sparse streams so a horizon window contains enough trades to
+     * carry a rate.
      */
+    horizonsSec: number[];
+    /** = horizonsSec[0] — kept for introspection compatibility */
     fastHorizonSec: number;
+    /** The canonical alert timescale (slow horizon; not the extended scale) */
     slowHorizonSec: number;
     /**
      * Per-channel score calibration from the null distribution of window maxima
-     * over the training data (see ChannelCalib / calibrateChannel).
+     * over the training data (see ChannelCalib / calibrateChannel), one entry
+     * per horizon in `horizonsSec`.
      */
     channelCalib: {
-        rateFast: ChannelCalib;
-        volFast: ChannelCalib;
-        rateSlow: ChannelCalib;
-        volSlow: ChannelCalib;
+        rate: ChannelCalib[];
+        vol: ChannelCalib[];
     };
     /** Peak λ(tᵢ) over the training window under the fitted Hawkes params */
     lambdaBaseline: number;
@@ -279,30 +310,30 @@ interface RobustStats {
 }
 /**
  * Per-channel score mapping, self-calibrated from the null distribution of
- * window maxima on the training data (see calibrateChannel):
+ * window maxima on the training data (see calibrateChannel).  Standardized
+ * exceedance t = (z − c − u·spanShift) / u is mapped through the rational
+ * sigmoid 0.5 + 0.5·t/(1+|t|):
  *
- *   score(z) = σ((z − c − u·spanShift) · ln3 / u)
+ *   z = c   (the calibrated level)   → t = 0 → score 0.5
+ *   z = c+u (one tail unit beyond)   → t = 1 → score 0.75
+ *   further tail units               → 0.83, 0.875, … approaching 1 slowly
  *
- *   c = P90 of the maxima the baseline itself produced    → score 0.5
- *   c + u (one tail unit, u = P99 − P90 of those maxima)  → score 0.75
- *   each further u beyond that                            → 0.9, 0.96, …
- *
- * Both anchors are floored by the universal mapping validated on a full day
- * of real data (CALIB_FALLBACK_RATE / CALIB_FALLBACK_VOL): the baseline's own
- * null distribution can
- * only make the detector stricter (hot/noisy baseline ⇒ higher, wider
- * mapping), never more trigger-happy — a 15–30 min window yields too few
- * null stretches to trust a low estimate of the normal tail.
+ * The level c = max(min(empirical q85 of the null maxima, Gumbel-left-fit
+ * q85), universal floor): the Gumbel term makes it robust to events inside
+ * the training window (contamination inflates only the upper quantiles), the
+ * floor is the mapping validated on a full day of real data
+ * (CALIB_FALLBACK_RATE / CALIB_FALLBACK_VOL) — a 15–30 min window yields too
+ * few null stretches to trust a very low estimate of the normal tail.
  */
 interface ChannelCalib {
-    /** Score-0.5 level: max(null P90 of window maxima, universal floor) */
+    /** Score-0.5 level: max(min(null q85, Gumbel-left q85), universal floor) */
     c: number;
     /** Universal tail unit; one u beyond c ⇒ 0.75 */
     u: number;
     /**
-     * Quantile ladder of the null window-maxima distribution
-     * [P50, P75, P80, P85, P90, P95, P97, P99] — exposed for introspection and
-     * threshold research (empty when the fallback mapping is in effect).
+     * Quantile ladder of the null window-maxima distribution at NULLQ_PCTS —
+     * exposed for introspection and threshold research (empty when the fallback
+     * mapping is in effect).
      */
     nullQ: number[];
 }

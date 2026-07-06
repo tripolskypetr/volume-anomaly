@@ -30,6 +30,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 interface Columns {
   ts:    Float64Array;  // ms
   qty:   Float64Array;
+  price: Float64Array;
   maker: Uint8Array;    // isBuyerMaker
   n:     number;
 }
@@ -40,6 +41,7 @@ function loadCsv(): Columns {
   const n     = lines.length;
   const ts    = new Float64Array(n);
   const qty   = new Float64Array(n);
+  const price = new Float64Array(n);
   const maker = new Uint8Array(n);
   let count = 0;
   for (const line of lines) {
@@ -49,10 +51,11 @@ function loadCsv(): Columns {
     if (parts.length < 7) continue;
     ts[count]    = Number(parts[5]) / 1000; // µs → ms
     qty[count]   = Number(parts[2]);
+    price[count] = Number(parts[1]);
     maker[count] = parts[6] === 'True' ? 1 : 0;
     count++;
   }
-  return { ts, qty, maker, n: count };
+  return { ts, qty, price, maker, n: count };
 }
 
 function makeWindow(c: Columns, from: number, to: number): IAggregatedTradeData[] {
@@ -82,6 +85,31 @@ function pct(xs: number[], p: number): number {
   return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))]!;
 }
 
+/**
+ * Mann-Whitney AUC: probability that a random positive outranks a random
+ * negative (ties get 0.5).  Score-free — depends only on the ranking, so any
+ * monotone re-mapping of the score leaves it unchanged.
+ */
+function auc(scores: number[], labels: boolean[]): number {
+  const idx = scores.map((_, i) => i).sort((a, b) => scores[a]! - scores[b]!);
+  // average ranks with ties
+  const ranks = new Array<number>(scores.length).fill(0);
+  for (let i = 0; i < idx.length; ) {
+    let j = i;
+    while (j + 1 < idx.length && scores[idx[j + 1]!] === scores[idx[i]!]) j++;
+    const avg = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[idx[k]!] = avg;
+    i = j + 1;
+  }
+  let posRankSum = 0, nPos = 0;
+  for (let i = 0; i < labels.length; i++) {
+    if (labels[i]) { posRankSum += ranks[i]!; nPos++; }
+  }
+  const nNeg = labels.length - nPos;
+  if (nPos === 0 || nNeg === 0) return NaN;
+  return (posRankSum - (nPos * (nPos + 1)) / 2) / (nPos * nNeg);
+}
+
 // ─── Sweep ────────────────────────────────────────────────────────────────────
 
 const BUCKET_MS  = 30_000;
@@ -101,11 +129,53 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
     const vol = new Array<number>(nBuckets).fill(0);
     const cnt = new Array<number>(nBuckets).fill(0);
     const firstIdx = new Array<number>(nBuckets).fill(-1);
+    const hi    = new Array<number>(nBuckets).fill(-Infinity);
+    const lo    = new Array<number>(nBuckets).fill(Infinity);
+    const close = new Array<number>(nBuckets).fill(0);
+    const open  = new Array<number>(nBuckets).fill(0);
     for (let i = 0; i < c.n; i++) {
       const b = Math.min(nBuckets - 1, Math.floor((c.ts[i]! - t0) / BUCKET_MS));
       vol[b]! += c.qty[i]!;
       cnt[b]! += 1;
-      if (firstIdx[b] === -1) firstIdx[b] = i;
+      if (firstIdx[b] === -1) { firstIdx[b] = i; open[b] = c.price[i]!; }
+      const p = c.price[i]!;
+      if (p > hi[b]!) hi[b] = p;
+      if (p < lo[b]!) lo[b] = p;
+      close[b] = p;
+    }
+    // Fill empty buckets forward so ranges/returns are well-defined
+    for (let b = 1; b < nBuckets; b++) {
+      if (close[b] === 0) { close[b] = close[b - 1]!; open[b] = close[b - 1]!; hi[b] = close[b - 1]!; lo[b] = close[b - 1]!; }
+    }
+
+    // ── Forward price response (predictive ground truth).
+    // fwdRange_K(b) = (max high − min low over buckets b+1..b+K) / close(b):
+    // "how much does price actually travel in the K buckets AFTER this one".
+    // Scored as robust z against the trailing hour of the same statistic, so
+    // "big move" means big relative to what the recent market was doing —
+    // the same locally-adaptive yardstick as the volume GT below.
+    const FWD_HORIZONS = [2, 10] as const;         // 1 min, 5 min
+    const fwdR = FWD_HORIZONS.map(() => new Array<number>(nBuckets).fill(0));
+    for (let b = 0; b < nBuckets; b++) {
+      for (let k = 0; k < FWD_HORIZONS.length; k++) {
+        const K = FWD_HORIZONS[k]!;
+        let h = -Infinity, l = Infinity;
+        for (let j = b + 1; j <= Math.min(b + K, nBuckets - 1); j++) {
+          if (hi[j]! > h) h = hi[j]!;
+          if (lo[j]! < l) l = lo[j]!;
+        }
+        fwdR[k]![b] = h > l && close[b]! > 0 ? (h - l) / close[b]! : 0;
+      }
+    }
+    const TRAIL_FWD = 120;
+    const fwdZ = FWD_HORIZONS.map(() => new Array<number>(nBuckets).fill(NaN));
+    for (let k = 0; k < FWD_HORIZONS.length; k++) {
+      for (let b = TRAIL_FWD; b < nBuckets - FWD_HORIZONS[k]!; b++) {
+        const w   = fwdR[k]!.slice(b - TRAIL_FWD, b);
+        const m   = median(w);
+        const mad = Math.max(median(w.map((x) => Math.abs(x - m))), 0.1 * m, 1e-12);
+        fwdZ[k]![b] = (fwdR[k]![b]! - m) / (1.4826 * mad);
+      }
     }
     // Ground truth: robust z-score vs the TRAILING hour, not the global day.
     // A global yardstick labels "NY hours are busier than the overnight
@@ -159,11 +229,32 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
       strong: { rate: [] as number[], vol: [] as number[] },
     };
 
+    // Per-bucket predictive join: detector confidence vs forward response.
+    const pred: Array<{ b: number; lab: Label; conf: number; anomaly: boolean; ret: number }> = [];
+
     const started = Date.now();
+    // Progress bar: one line per ~5% of the day (vitest streams stdout live,
+    // so a long sweep shows movement instead of silence until the report).
+    const PROG_STEP = Math.max(1, Math.floor(nBuckets / 20));
+    const progress = (b: number) => {
+      const frac    = b / nBuckets;
+      const BAR     = 24;
+      const filled  = Math.round(frac * BAR);
+      const elapsed = (Date.now() - started) / 1000;
+      const eta     = elapsed * (1 - frac) / Math.max(frac, 1e-9);
+      console.log(
+        `[${'█'.repeat(filled)}${'░'.repeat(BAR - filled)}] ${(frac * 100).toFixed(0).padStart(3)}%` +
+        `  bucket ${b}/${nBuckets}  elapsed ${Math.round(elapsed)}s  ETA ${Math.round(eta)}s`,
+      );
+    };
+
     for (let b = 0; b < nBuckets; b++) {
+      if (b > 0 && b % PROG_STEP === 0) progress(b);
       const lab = label(b);
-      if (lab === 'gray') continue;
+      // Gray buckets are excluded from the gate metrics (ambiguous GT) but
+      // still evaluated: the predictive benchmark needs full coverage.
       const fi = firstIdx[b]!;
+      if (fi === -1) continue;
 
       // historical = trades from the 30 minutes preceding the bucket start —
       // a TIME-based baseline.  A count-based baseline ("last 500 trades")
@@ -205,29 +296,39 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         calls.push({
           s: Math.log10(Math.max(1, spanSec / m.slowHorizonSec)),
           z: [rc.stats.zRate, rc.stats.zVol, rc.stats.zRateSlow, rc.stats.zVolSlow],
+          // full per-scale vectors (one entry per m.horizonsSec)
+          zr: rc.stats.zRates, zv2: rc.stats.zVols,
         });
         if (e >= end) break;
       }
 
-      const bucket = lab === 'strong' ? sub.strong : sub.normal;
-      bucket.hawkes.push(r.scores.hawkes);
-      bucket.cusum.push(r.scores.cusum);
-      bucket.bocpd.push(r.scores.bocpd);
-      const rat = lab === 'strong' ? ratios.strong : ratios.normal;
-      rat.rate.push(rr);
-      rat.vol.push(vr);
+      if (lab !== 'gray') {
+        const bucket = lab === 'strong' ? sub.strong : sub.normal;
+        bucket.hawkes.push(r.scores.hawkes);
+        bucket.cusum.push(r.scores.cusum);
+        bucket.bocpd.push(r.scores.bocpd);
+        const rat = lab === 'strong' ? ratios.strong : ratios.normal;
+        rat.rate.push(rr);
+        rat.vol.push(vr);
+      }
+      const retBps = close[b]! > 0 && open[b]! > 0 ? Math.abs(Math.log(close[b]! / open[b]!)) * 1e4 : 0;
+      pred.push({ b, lab, conf: r.confidence, anomaly: r.anomaly, ret: retBps });
       rows.push({
         b, lab,
         h: r.scores.hawkes, c: r.scores.cusum, p: r.scores.bocpd,
         rr, vr, zv: zVol[b]!, zc: zCnt[b]!,
+        // forward price response (predictive GT): z of forward 1min/5min range
+        fz1: fwdZ[0]![b]!, fz5: fwdZ[1]![b]!,
+        // current-bucket |return| in bps — the naive momentum baseline
+        ret: retBps,
         calls,
-        // Null quantile ladders [P50,P75,P80,P85,P90,P95,P97,P99] per channel
-        nq: [
-          m.channelCalib.rateFast.nullQ,
-          m.channelCalib.volFast.nullQ,
-          m.channelCalib.rateSlow.nullQ,
-          m.channelCalib.volSlow.nullQ,
-        ],
+        // Null quantile ladders (NULLQ_PCTS percentiles): rate then vol
+        // channel per horizon, plus the horizon family itself
+        hs: m.horizonsSec,
+        nq: m.horizonsSec.flatMap((_, k) => [
+          m.channelCalib.rate[k]!.nullQ,
+          m.channelCalib.vol[k]!.nullQ,
+        ]),
       });
 
       if (lab === 'strong') {
@@ -235,7 +336,7 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         strongFlagged.set(b, r.anomaly);
         if (r.anomaly) tp++;
         else { fnCount++; missed.push({ b, conf: r.confidence, zv: zVol[b]!, zc: zCnt[b]! }); }
-      } else {
+      } else if (lab === 'normal') {
         normalConf.push(r.confidence);
         if (r.anomaly) {
           fp++;
@@ -292,6 +393,38 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
       console.log(`missed strong buckets (${missed.length}):`);
       for (const m2 of missed.slice(0, 15)) {
         console.log(`  bucket ${m2.b}  conf=${m2.conf.toFixed(3)}  zVol=${m2.zv.toFixed(1)}  zCnt=${m2.zc.toFixed(1)}`);
+      }
+    }
+
+    // ── Predictive benchmark: does confidence rank FUTURE price movement?
+    // The volume GT above is nearly the detector's own statistic, so recall
+    // against it has a self-agreement ceiling.  Here the target is external:
+    // forward 1min/5min price range, z-scored vs the trailing hour.  Reported
+    // vs two reference rankers: the GT volume z itself (what a perfect
+    // volume-anomaly detector could achieve) and the naive momentum baseline
+    // (current-bucket |return| — "price is already moving").
+    console.log('');
+    console.log('── predictive (forward price response) ──');
+    for (let k = 0; k < FWD_HORIZONS.length; k++) {
+      const horizon = FWD_HORIZONS[k]! === 2 ? '1min' : '5min';
+      const rowsOk  = pred.filter((p) => Number.isFinite(fwdZ[k]![p.b]!));
+      const zs      = rowsOk.map((p) => fwdZ[k]![p.b]!);
+      for (const THR of [2, 4]) {
+        const moved  = zs.map((z) => z >= THR);
+        const nMoved = moved.filter(Boolean).length;
+        const aucConf = auc(rowsOk.map((p) => p.conf), moved);
+        const aucGt   = auc(rowsOk.map((p) => Math.max(zVol[p.b]!, zCnt[p.b]!)), moved);
+        const aucRet  = auc(rowsOk.map((p) => p.ret), moved);
+        let movedAndFlagged = 0, flagged = 0;
+        for (let i = 0; i < rowsOk.length; i++) {
+          if (rowsOk[i]!.anomaly) { flagged++; if (moved[i]) movedAndFlagged++; }
+        }
+        const pMovedGivenAnomaly = movedAndFlagged / Math.max(flagged, 1);
+        console.log(
+          `fwd ${horizon} z≥${THR}: base rate ${(100 * nMoved / zs.length).toFixed(1)}%  ` +
+          `P(move|anomaly)=${(100 * pMovedGivenAnomaly).toFixed(1)}%  ` +
+          `AUC conf=${aucConf.toFixed(3)}  AUC gtZ=${aucGt.toFixed(3)}  AUC |ret|=${aucRet.toFixed(3)}`,
+        );
       }
     }
 

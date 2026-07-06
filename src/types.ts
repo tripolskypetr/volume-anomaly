@@ -36,8 +36,14 @@ export interface PredictionResult {
    * override) is clamped at zero before the symmetric ± comparison.
    */
   direction:  Direction;
-  /** Signed imbalance [-1,+1]. Positive = buy-side pressure. */
+  /** Signed imbalance [-1,+1] over the full window. Positive = buy-side pressure. */
   imbalance:  number;
+  /**
+   * Imbalance inside the peak burst window (see DetectionResult.burstImbalance).
+   * `direction` is derived from THIS value — the full-window `imbalance`
+   * dilutes a burst's onset direction with surrounding two-way flow.
+   */
+  burstImbalance: number;
 }
 
 // ─── Detection result ─────────────────────────────────────────────────────────
@@ -78,11 +84,36 @@ export interface DetectionResult {
     zRateSlow:   number;
     zVolSlow:    number;
     lambdaRatio: number;
+    /**
+     * Per-scale peak robust z, one entry per trained horizon
+     * (TrainedModels.horizonsSec, ascending).  zRate/zVol/zRateSlow/zVolSlow
+     * above are the fastest/slow entries of these, kept for compatibility.
+     */
+    zRates:      number[];
+    zVols:       number[];
   };
   /** Per-detector signals that fired */
   signals:        AnomalySignal[];
   /** Estimated imbalance [-1,+1]: positive = buy pressure */
   imbalance:      number;
+  /**
+   * Order-flow imbalance [-1,+1] measured INSIDE the peak burst window (the
+   * rolling window that produced the winning volume/rate channel), not over
+   * the whole detection window — a burst's onset direction gets diluted by
+   * surrounding two-way flow.  Shrunk toward the training buy/sell balance by
+   * effective sample size (Kish n_eff over qty), so a few-trade or one-whale
+   * window carries little directional weight.  Falls back to the shrunk
+   * full-window imbalance when no channel produced a trade-aligned peak.
+   * predict() derives `direction` from this field.
+   */
+  burstImbalance: number;
+  /**
+   * Timestamp (ms) of the last trade of the peak burst window — when the
+   * anomaly actually peaked inside the detection window.  Last trade of the
+   * window when no channel produced a trade-aligned peak; 0 for an empty
+   * window.
+   */
+  peakTs:         number;
   /** Peak Hawkes conditional intensity λ(tᵢ) seen across all trades in the detection window */
   hawkesLambda:   number;
   /** CUSUM statistic (+ side) at last observation */

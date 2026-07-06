@@ -115,29 +115,35 @@ export interface TrainedModels {
    */
   /**
    * Robust location/scale of the rolling arrival rate (events/s) and rolling
-   * volume rate (qty/s), per horizon.  detect() scores its peak rolling rate
-   * as a robust z against these: z = (peak − med) / (1.4826 · MAD).
-   * "fast" = brief bursts, "slow" = sustained volume waves spread too evenly
-   * to concentrate at the fast horizon.
+   * volume rate (qty/s), one entry per horizon in `horizonsSec`.  detect()
+   * scores its peak rolling rate at each scale as a robust z against these:
+   * z = (peak − med) / (1.4826 · MAD).  Short horizons catch brief bursts,
+   * long ones sustained volume waves spread too evenly to concentrate at the
+   * short scales.
    */
-  rateStats:           { fast: RobustStats; slow: RobustStats };
-  volStats:            { fast: RobustStats; slow: RobustStats };
+  rateStats:           RobustStats[];
+  volStats:            RobustStats[];
   /**
-   * Effective horizons chosen at train() time (seconds).  Equal to the config
-   * values when pinned explicitly; otherwise scaled up on the fly for sparse
-   * streams so a horizon window contains enough trades to carry a rate.
+   * Multi-scale horizon family chosen at train() time (seconds, ascending):
+   * fast, an optional geometric-mean mid scale, slow, and an optional
+   * extended scale (up to 3× slow, capped by the training span).  Fast/slow
+   * equal the config values when pinned explicitly; otherwise scaled up on
+   * the fly for sparse streams so a horizon window contains enough trades to
+   * carry a rate.
    */
+  horizonsSec:         number[];
+  /** = horizonsSec[0] — kept for introspection compatibility */
   fastHorizonSec:      number;
+  /** The canonical alert timescale (slow horizon; not the extended scale) */
   slowHorizonSec:      number;
   /**
    * Per-channel score calibration from the null distribution of window maxima
-   * over the training data (see ChannelCalib / calibrateChannel).
+   * over the training data (see ChannelCalib / calibrateChannel), one entry
+   * per horizon in `horizonsSec`.
    */
   channelCalib: {
-    rateFast: ChannelCalib;
-    volFast:  ChannelCalib;
-    rateSlow: ChannelCalib;
-    volSlow:  ChannelCalib;
+    rate: ChannelCalib[];
+    vol:  ChannelCalib[];
   };
   /** Peak λ(tᵢ) over the training window under the fitted Hawkes params */
   lambdaBaseline:      number;
@@ -174,6 +180,58 @@ function arrayMax(xs: number[]): number {
   return m;
 }
 
+/** Index of the maximum element (first occurrence); -1 for an empty array. */
+function argMax(xs: number[]): number {
+  let m = -Infinity, idx = -1;
+  for (let i = 0; i < xs.length; i++) {
+    if (xs[i]! > m) { m = xs[i]!; idx = i; }
+  }
+  return idx;
+}
+
+/**
+ * Prior strength (in effective trades) for the burst-imbalance shrinkage:
+ * the burst window's buy fraction is pulled toward the training buy fraction
+ * as if the baseline had contributed this many trades.  A 5-trade burst is
+ * shrunk ~2/3 toward baseline (±1 imbalance by chance stops reading as
+ * directional conviction); a 100-trade burst keeps ~90% of its signal.
+ */
+const BURST_PRIOR_STRENGTH = 10;
+
+/**
+ * Qty-weighted imbalance of trades[from..to), shrunk toward NEUTRAL (buy
+ * fraction 0.5).  Effective sample size is Kish's n_eff = (Σq)²/Σq², so a
+ * "burst" that is one whale trade (n_eff ≈ 1) carries almost no directional
+ * evidence regardless of its size, while many similar trades count fully.
+ * This is the estimation form of a binomial significance test: strength of
+ * evidence scales the deviation instead of hard-gating it.
+ *
+ * The prior center is deliberately 0.5, NOT the training buy fraction:
+ * direction semantics are absolute ("buy aggression" ⇒ imbalance > 0), and a
+ * baseline-centered prior would make every low-evidence window inherit the
+ * baseline's own bias — a balanced burst after a sell-heavy baseline read as
+ * conviction 'short'.  Relativity to the baseline is already encoded in the
+ * directional threshold (trained imbalance quantile) applied by predict().
+ */
+function shrunkImbalance(
+  trades: IAggregatedTradeData[],
+  from:   number,
+  to:     number,
+): number {
+  let buyVol = 0, sellVol = 0, sumQ2 = 0;
+  for (let i = from; i < to; i++) {
+    const q = trades[i]!.qty;
+    if (trades[i]!.isBuyerMaker) sellVol += q; else buyVol += q;
+    sumQ2 += q * q;
+  }
+  const total = buyVol + sellVol;
+  if (!(total > 0) || !(sumQ2 > 0)) return 0;
+  const nEff  = (total * total) / sumQ2;
+  const p     = buyVol / total;
+  const pStar = (nEff * p + BURST_PRIOR_STRENGTH * 0.5) / (nEff + BURST_PRIOR_STRENGTH);
+  return 2 * pStar - 1;
+}
+
 function robustStats(xs: number[]): RobustStats {
   if (xs.length === 0) return { med: 0, mad: 0 };
   const med = quantile(xs, 50);
@@ -202,33 +260,41 @@ function robustZ(x: number, s: RobustStats): number {
 
 /**
  * Per-channel score mapping, self-calibrated from the null distribution of
- * window maxima on the training data (see calibrateChannel):
+ * window maxima on the training data (see calibrateChannel).  Standardized
+ * exceedance t = (z − c − u·spanShift) / u is mapped through the rational
+ * sigmoid 0.5 + 0.5·t/(1+|t|):
  *
- *   score(z) = σ((z − c − u·spanShift) · ln3 / u)
+ *   z = c   (the calibrated level)   → t = 0 → score 0.5
+ *   z = c+u (one tail unit beyond)   → t = 1 → score 0.75
+ *   further tail units               → 0.83, 0.875, … approaching 1 slowly
  *
- *   c = P90 of the maxima the baseline itself produced    → score 0.5
- *   c + u (one tail unit, u = P99 − P90 of those maxima)  → score 0.75
- *   each further u beyond that                            → 0.9, 0.96, …
- *
- * Both anchors are floored by the universal mapping validated on a full day
- * of real data (CALIB_FALLBACK_RATE / CALIB_FALLBACK_VOL): the baseline's own
- * null distribution can
- * only make the detector stricter (hot/noisy baseline ⇒ higher, wider
- * mapping), never more trigger-happy — a 15–30 min window yields too few
- * null stretches to trust a low estimate of the normal tail.
+ * The level c = max(min(empirical q85 of the null maxima, Gumbel-left-fit
+ * q85), universal floor): the Gumbel term makes it robust to events inside
+ * the training window (contamination inflates only the upper quantiles), the
+ * floor is the mapping validated on a full day of real data
+ * (CALIB_FALLBACK_RATE / CALIB_FALLBACK_VOL) — a 15–30 min window yields too
+ * few null stretches to trust a very low estimate of the normal tail.
  */
 interface ChannelCalib {
-  /** Score-0.5 level: max(null P90 of window maxima, universal floor) */
+  /** Score-0.5 level: max(min(null q85, Gumbel-left q85), universal floor) */
   c: number;
   /** Universal tail unit; one u beyond c ⇒ 0.75 */
   u: number;
   /**
-   * Quantile ladder of the null window-maxima distribution
-   * [P50, P75, P80, P85, P90, P95, P97, P99] — exposed for introspection and
-   * threshold research (empty when the fallback mapping is in effect).
+   * Quantile ladder of the null window-maxima distribution at NULLQ_PCTS —
+   * exposed for introspection and threshold research (empty when the fallback
+   * mapping is in effect).
    */
   nullQ: number[];
 }
+
+/**
+ * Percentiles reported in ChannelCalib.nullQ.  The lower half exists for
+ * contamination-robust research: an event inside the training window inflates
+ * only the UPPER quantiles of the window-maxima distribution, so a clean-tail
+ * estimate must anchor on the left part.
+ */
+export const NULLQ_PCTS = [5, 10, 25, 50, 75, 80, 85, 90, 95, 97, 99] as const;
 
 /**
  * Universal floor/fallback mappings, found by dense brute force over the
@@ -249,6 +315,15 @@ interface ChannelCalib {
  */
 const CALIB_FALLBACK_RATE: ChannelCalib = { c: 14,  u: 5.5, nullQ: [] };
 const CALIB_FALLBACK_VOL:  ChannelCalib = { c: 6.5, u: 5.5, nullQ: [] };
+
+/**
+ * Floor surcharge for the non-canonical scan scales (mid / extended): the
+ * universal floors above were validated for the fast/slow scales, and every
+ * extra scale is an extra look at the same stream, so the cross-scale max
+ * needs a mild multiplicity correction.  Measured Pareto-best at 1.15 on the
+ * full-day benchmark (grid 1.0 / 1.15 / 1.3 / 1.5).
+ */
+const NONCANONICAL_FLOOR_MULT = 1.15;
 
 // ─── Serialization ────────────────────────────────────────────────────────────
 
@@ -443,31 +518,56 @@ export class VolumeAnomalyDetector {
         );
     if (slowHorizonSec < fastHorizonSec) slowHorizonSec = fastHorizonSec;
 
-    const fast = this.rollingRates(sorted, allTimestamps, fastHorizonSec);
-    const slow = this.rollingRates(sorted, allTimestamps, slowHorizonSec);
-    const rateStats = { fast: robustStats(fast.rates),    slow: robustStats(slow.rates) };
-    const volStats  = { fast: robustStats(fast.volRates), slow: robustStats(slow.volRates) };
+    // ── Multi-scale horizon family (scan statistic).
+    // Two fixed horizons are a two-tooth comb: a burst living at ~2× the fast
+    // horizon or a wave at ~3× the slow one dilutes at both and loses z.  Add
+    // a geometric-mean MID scale between fast and slow (when they are far
+    // enough apart to leave a gap) and an EXTENDED scale above slow (when the
+    // training span can still calibrate it: same span/4 cap as slow).  Every
+    // scale runs the same statistic → robust z → null-calibrated mapping; the
+    // final score is the calibrated max over all scales (each scale's own
+    // null absorbs its multiple-look cost).
+    const horizonsSec: number[] = [fastHorizonSec];
+    if (slowHorizonSec / fastHorizonSec >= 4) {
+      horizonsSec.push(Math.sqrt(fastHorizonSec * slowHorizonSec));
+    }
+    if (slowHorizonSec > horizonsSec[horizonsSec.length - 1]!) {
+      horizonsSec.push(slowHorizonSec);
+    }
+    const extendedSec = Math.min(3 * slowHorizonSec, Math.max(spanSec / 4, slowHorizonSec));
+    if (extendedSec >= 2 * slowHorizonSec) horizonsSec.push(extendedSec);
 
-    // ── Score-mapping calibration from the null distribution: what peak z
-    // does this baseline produce on its own, in alert-sized stretches?
-    const calib = (
-      samples:  number[],
-      stats:    RobustStats,
-      firstIdx: number,
-      fallback: ChannelCalib,
-    ): ChannelCalib =>
-      this.calibrateChannel(
-        samples.map((x) => robustZ(x, stats)),
-        firstIdx >= 0 ? allTimestamps.slice(firstIdx) : [],
-        slowHorizonSec,
-        fallback,
-      );
-    const channelCalib = {
-      rateFast: calib(fast.rates,    rateStats.fast, fast.firstIdx, CALIB_FALLBACK_RATE),
-      volFast:  calib(fast.volRates, volStats.fast,  fast.firstIdx, CALIB_FALLBACK_VOL),
-      rateSlow: calib(slow.rates,    rateStats.slow, slow.firstIdx, CALIB_FALLBACK_RATE),
-      volSlow:  calib(slow.volRates, volStats.slow,  slow.firstIdx, CALIB_FALLBACK_VOL),
-    };
+    // ── Per-scale stats + score-mapping calibration from the null
+    // distribution: what peak z does this baseline produce on its own, in
+    // alert-sized stretches?
+    const rateStats: RobustStats[] = [];
+    const volStats:  RobustStats[] = [];
+    const calibRate: ChannelCalib[] = [];
+    const calibVol:  ChannelCalib[] = [];
+    for (const h of horizonsSec) {
+      const roll = this.rollingRates(sorted, allTimestamps, h);
+      const rs   = robustStats(roll.rates);
+      const vs   = robustStats(roll.volRates);
+      rateStats.push(rs);
+      volStats.push(vs);
+      const ts = roll.firstIdx >= 0 ? allTimestamps.slice(roll.firstIdx) : [];
+      // Non-canonical scales (mid/extended) pay a floor surcharge: the
+      // universal floors were brute-force-validated FOR the fast/slow scales,
+      // and extra scales are extra looks at the same stream — the cross-scale
+      // max needs a mild multiplicity correction.  ×1.15 measured Pareto-best
+      // on the full-day benchmark (same recall/events as ×1.0, −0.25% FP;
+      // ×1.3 starts trading recall away).
+      const mult     = h === fastHorizonSec || h === slowHorizonSec ? 1 : NONCANONICAL_FLOOR_MULT;
+      const fbRate   = mult === 1 ? CALIB_FALLBACK_RATE : { ...CALIB_FALLBACK_RATE, c: CALIB_FALLBACK_RATE.c * mult };
+      const fbVol    = mult === 1 ? CALIB_FALLBACK_VOL  : { ...CALIB_FALLBACK_VOL,  c: CALIB_FALLBACK_VOL.c  * mult };
+      calibRate.push(this.calibrateChannel(
+        roll.rates.map((x) => robustZ(x, rs)), ts, slowHorizonSec, fbRate,
+      ));
+      calibVol.push(this.calibrateChannel(
+        roll.volRates.map((x) => robustZ(x, vs)), ts, slowHorizonSec, fbVol,
+      ));
+    }
+    const channelCalib = { rate: calibRate, vol: calibVol };
 
     // ── Hawkes: fit to trade arrival times (in seconds).
     // MLE cost grows with n and the fit only needs recent arrival structure —
@@ -544,6 +644,7 @@ export class VolumeAnomalyDetector {
       imbalanceThreshold,
       rateStats,
       volStats,
+      horizonsSec,
       fastHorizonSec,
       slowHorizonSec,
       channelCalib,
@@ -580,7 +681,7 @@ export class VolumeAnomalyDetector {
     VolumeAnomalyDetector.assertMillis(sorted[0]!.timestamp);
     const {
       hawkesParams, cusumParams, bocpdPrior,
-      rateStats, volStats, fastHorizonSec, slowHorizonSec, channelCalib,
+      rateStats, volStats, horizonsSec, slowHorizonSec, channelCalib,
       lambdaBaseline, bocpdNoiseFloor,
     } = this.models;
     const [wH, wC, wB] = this.cfg.scoreWeights;
@@ -604,42 +705,100 @@ export class VolumeAnomalyDetector {
     const lambda     = hawkesPeakLambda(timestamps, hawkesParams);
     const spanSec    = timestamps[timestamps.length - 1]! - timestamps[0]!;
     const spanShift  = Math.log10(Math.max(1, spanSec / slowHorizonSec));
-    const LN3        = Math.log(3);
-    // Clamped just below 1: with a tight tail unit the sigmoid's exponent can
-    // underflow to exactly 1.0, and a confidence threshold of 1.0 must keep
-    // its "never fires" semantics.
-    const chScore    = (z: number, cal: ChannelCalib) =>
-      Math.min(
-        1 / (1 + Math.exp(-((z - cal.c - cal.u * spanShift) * LN3) / cal.u)),
-        1 - 1e-9,
-      );
+    // Standardized channel exceedance: t = 0 at the calibrated level (score
+    // 0.5), t = 1 one tail unit beyond it (score 0.75).
+    const chT = (z: number, cal: ChannelCalib) => (z - cal.c - cal.u * spanShift) / cal.u;
+    // Rational (algebraic) sigmoid t → score.  Same anchors as the previous
+    // exponential sigmoid — 0.5 at t=0, 0.75 at t=1, so decisions at the
+    // default 0.75 threshold are identical — but the top approaches 1
+    // harmonically instead of exponentially: no double-precision saturation,
+    // so the score keeps RANKING extreme events (predictive use) instead of
+    // collapsing everything strong into ties at ≈1.  Never reaches 1, which
+    // preserves the "confidence 1.0 never fires" semantics without a clamp.
+    const ratSig = (t: number) => 0.5 + (0.5 * t) / (1 + Math.abs(t));
 
     let zRate = 0, zVol = 0, zRateSlow = 0, zVolSlow = 0;
+    let hawkesScore = 0;
+    // Peak burst window of the winning channel: trade index of the rolling
+    // window END whose statistic won the score, plus that channel's horizon.
+    let peakIdx = -1, peakHorizonSec = 0;
+    const zRates: number[] = [];
+    const zVols:  number[] = [];
     if (timestamps.length >= 2) {
-      const fast = this.rollingRates(sorted, timestamps, fastHorizonSec);
-      const slow = this.rollingRates(sorted, timestamps, slowHorizonSec);
-      zRate     = robustZ(arrayMax(fast.rates),    rateStats.fast);
-      zVol      = robustZ(arrayMax(fast.volRates), volStats.fast);
-      zRateSlow = robustZ(arrayMax(slow.rates),    rateStats.slow);
-      zVolSlow  = robustZ(arrayMax(slow.volRates), volStats.slow);
+      // Multi-scale scan: every horizon in the trained family contributes a
+      // rate and a volume channel; each channel is standardized against its
+      // OWN null calibration, so scales are comparable and the max is fair.
+      let tRateBest = -Infinity, tVolBest = -Infinity;
+      let bestT = -Infinity;
+      const iSlow = horizonsSec.indexOf(slowHorizonSec);
+      for (let k = 0; k < horizonsSec.length; k++) {
+        const roll = this.rollingRates(sorted, timestamps, horizonsSec[k]!);
+        for (const isRate of [true, false]) {
+          const xs    = isRate ? roll.rates    : roll.volRates;
+          const stats = isRate ? rateStats[k]! : volStats[k]!;
+          const cal   = isRate ? channelCalib.rate[k]! : channelCalib.vol[k]!;
+          const ai = argMax(xs);
+          const z  = ai >= 0 ? robustZ(xs[ai]!, stats) : 0;
+          const t  = ai >= 0 ? chT(z, cal) : -Infinity;
+          if (isRate) { zRates.push(z); if (t > tRateBest) tRateBest = t; }
+          else        { zVols.push(z);  if (t > tVolBest)  tVolBest  = t; }
+          if (t > bestT) {
+            bestT = t;
+            // firstIdx < 0 → single whole-window fallback sample, not trade-aligned
+            peakIdx        = roll.firstIdx >= 0 ? roll.firstIdx + ai : -1;
+            peakHorizonSec = horizonsSec[k]!;
+          }
+          // stats reporting keeps the fastest/slow scales (API compatibility)
+          if (k === 0)     { if (isRate) zRate     = z; else zVol     = z; }
+          if (k === iSlow) { if (isRate) zRateSlow = z; else zVolSlow = z; }
+        }
+      }
+      // Corroboration (Stouffer): a moderate arrival-rate excess AND a
+      // moderate volume excess together are stronger evidence than either
+      // alone, which a pure max() discards.  Combined strictly ACROSS types
+      // (best rate-t with best vol-t): scales of the SAME type see the same
+      // underlying wiggle at different bandwidths, and letting them
+      // corroborate each other double-counts one piece of evidence
+      // (measured: same-type cross-scale corroboration pushed borderline
+      // normal buckets over the threshold and raised FP with no recall gain).
+      // Only positive support from the other type counts, and the leader
+      // alone is the floor.
+      const tLead  = Math.max(tRateBest, tVolBest);
+      const tOther = Math.min(tRateBest, tVolBest);
+      const combined = Number.isFinite(tLead)
+        ? Math.max(tLead, (tLead + Math.max(Number.isFinite(tOther) ? tOther : 0, 0)) / Math.SQRT2)
+        : -Infinity;
+      hawkesScore = Number.isFinite(combined) ? ratSig(combined) : 0;
     }
     // λ ratio (peak Hawkes intensity vs the training peak) is reported in
     // stats/meta for transparency but deliberately kept OUT of the score: it
     // correlates with the rate z-channels and only added false-positive tail
     // in the real-data evaluation.
     const lambdaRatio = lambdaBaseline > 0 && Number.isFinite(lambda) ? lambda / lambdaBaseline : 0;
-    const hawkesScore = timestamps.length >= 2
-      ? Math.max(
-          chScore(zRate,     channelCalib.rateFast),
-          chScore(zVol,      channelCalib.volFast),
-          chScore(zRateSlow, channelCalib.rateSlow),
-          chScore(zVolSlow,  channelCalib.volSlow),
-        )
-      : 0;
 
     // ── 2. Current imbalance (full window, signed — for direction reporting)
     const imbalance = volumeImbalance(sorted);
     const absImb    = Math.abs(imbalance);
+
+    // ── 2b. Burst-local imbalance: order flow inside the winning channel's
+    // peak rolling window, not the whole detection window.  A burst's onset
+    // direction gets diluted by post-burst two-way flow when measured over
+    // the full window (measured on real data: −0.42 full-window vs −0.9 at
+    // the burst).  Shrunk toward the training buy fraction by effective
+    // sample size (see shrunkImbalance) so a few-trade or one-whale "burst"
+    // does not fake directional conviction.
+    const n = sorted.length;
+    let burstImbalance: number;
+    let peakTs = sorted[n - 1]!.timestamp;
+    if (peakIdx >= 0) {
+      const tEnd = timestamps[peakIdx]!;
+      let j = peakIdx;
+      while (j > 0 && timestamps[j - 1]! > tEnd - peakHorizonSec) j--;
+      burstImbalance = shrunkImbalance(sorted, j, peakIdx + 1);
+      peakTs         = sorted[peakIdx]!.timestamp;
+    } else {
+      burstImbalance = shrunkImbalance(sorted, 0, n);
+    }
 
     // ── 3. CUSUM on |imbalance| rolling series.
     // Track the peak S/h ratio seen during the run, including just before any
@@ -733,9 +892,11 @@ export class VolumeAnomalyDetector {
       anomaly:      combined >= confidence,
       confidence:   combined,
       scores:       { hawkes: hawkesScore, cusum: cusumScore, bocpd: bocpdScore },
-      stats:        { zRate, zVol, zRateSlow, zVolSlow, lambdaRatio },
+      stats:        { zRate, zVol, zRateSlow, zVolSlow, lambdaRatio, zRates, zVols },
       signals,
       imbalance,
+      burstImbalance,
+      peakTs,
       hawkesLambda: lambda,
       cusumStat:    Math.max(cusumState.sPos, cusumState.sNeg),
       runLength:    bocpdResult.mapRunLength,
@@ -849,8 +1010,30 @@ export class VolumeAnomalyDetector {
     }
     if (maxima.length < 8) return fallback;
 
-    const nullQ = [50, 75, 80, 85, 90, 95, 97, 99].map((p) => quantile(maxima, p));
-    const q85 = nullQ[3]!;
+    const nullQ = NULLQ_PCTS.map((p) => quantile(maxima, p));
+    const q85 = nullQ[NULLQ_PCTS.indexOf(85)]!;
+
+    // ── Contamination-robust level: an event INSIDE the training window
+    // inflates only the upper quantiles of the window-maxima distribution, so
+    // the empirical q85 of a "hot" baseline deafens the detector to the very
+    // escalation it precedes.  Fit a Gumbel (the max-domain law for
+    // light-tailed maxima) to the LEFT quantiles [P25, P50, P75] — where
+    // contamination does not live — and extrapolate a clean q85 from it.
+    // Level = min(empirical q85, Gumbel q85): equal on clean baselines,
+    // Gumbel wins on contaminated ones.  Measured on the full-day benchmark:
+    // reaches 96.8% event recall at 2.66% FP where the empirical-only level
+    // needed 3.45%.
+    const xg = (p: number) => -Math.log(-Math.log(p));
+    const pts: Array<[number, number]> = [25, 50, 75].map(
+      (p) => [xg(p / 100), nullQ[NULLQ_PCTS.indexOf(p as 25 | 50 | 75)]!] as [number, number],
+    );
+    const mx = (pts[0]![0] + pts[1]![0] + pts[2]![0]) / 3;
+    const my = (pts[0]![1] + pts[1]![1] + pts[2]![1]) / 3;
+    let sxy = 0, sxx = 0;
+    for (const [x, y] of pts) { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; }
+    const beta    = sxy / sxx;                 // Gumbel scale
+    const cGumbel = (my - beta * mx) + beta * xg(0.85);
+
     // Only the LEVEL adapts; the tail unit stays universal.  Measured on the
     // real-data benchmark:
     //  - the fallback level acts as a FLOOR, not just a fallback — a 15–30 min
@@ -859,15 +1042,14 @@ export class VolumeAnomalyDetector {
     //    a low estimate raised false alarms;
     //  - anchoring the level at null P99 (instead of P85) crushed escalating
     //    events whose baseline was already hot (spike_2 fixture);
-    //  - adapting the tail unit u to the null spread (P99 − P90) exploded on
-    //    event-contaminated baselines (u ≈ 300) and flattened the mapping so
-    //    much that z ≈ 190 scored only ≈ 0.65.
+    //  - adapting the tail unit u to the null spread (empirical P99 − P90
+    //    OR the Gumbel-fitted spread) traded away score comparability across
+    //    baselines: forward-move ranking (AUC) dropped measurably, so u stays
+    //    fixed even though the adaptive variant bought ~2 recall points.
     // The P85 anchor and the per-channel-type floors/tail unit come from the
     // dense brute-force search (see CALIB_FALLBACK_RATE/_VOL).
-    // So: quiet baselines get exactly the validated universal mapping; hot or
-    // noisy baselines raise the level, with the universal tail unit on top.
     return {
-      c: Math.max(q85, fallback.c),
+      c: Math.max(Math.min(q85, cGumbel), fallback.c),
       u: fallback.u,
       nullQ,
     };
@@ -898,9 +1080,11 @@ export class VolumeAnomalyDetector {
       anomaly:      false,
       confidence:   0,
       scores:       { hawkes: 0, cusum: 0, bocpd: 0 },
-      stats:        { zRate: 0, zVol: 0, zRateSlow: 0, zVolSlow: 0, lambdaRatio: 0 },
+      stats:        { zRate: 0, zVol: 0, zRateSlow: 0, zVolSlow: 0, lambdaRatio: 0, zRates: [], zVols: [] },
       signals:      [],
       imbalance:    0,
+      burstImbalance: 0,
+      peakTs:       0,
       hawkesLambda: 0,
       cusumStat:    0,
       runLength:    0,

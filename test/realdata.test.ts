@@ -169,7 +169,11 @@ describe('realdata: VolumeAnomalyDetector on BTCUSDT-2025-03-01', () => {
     const r     = det.detect(spike4.recent, 0.6);
     const vsig  = r.signals.find(s => s.kind === 'volume_spike');
     expect(vsig).toBeDefined();
-    expect(vsig!.score).toBeGreaterThanOrEqual(0.99);
+    // Rational (algebraic) sigmoid: the top end approaches 1 harmonically to
+    // preserve ranking of extreme events, so "at ceiling" is ≥ 0.97 (that is
+    // ~16 tail units beyond the calibrated level), not the old exponential
+    // saturation at ≥ 0.99.
+    expect(vsig!.score).toBeGreaterThanOrEqual(0.97);
   });
 
   // ── calm baseline: no anomaly ────────────────────────────────────────────────
@@ -214,13 +218,18 @@ describe('realdata: predict() direction on BTCUSDT-2025-03-01', () => {
     expect(r.direction).toBe('short');
   });
 
-  it('spike_3 — direction=short with explicit threshold 0.3', () => {
-    // The trained p75 threshold from spike_3's trending baseline is ≈ 0.62,
-    // stricter than the bucket's −0.39 imbalance → neutral by default.
-    // With an explicit 0.3 threshold the sell-side direction is reported.
+  it('spike_3 — HFT micro-burst is directionless even at explicit threshold 0.3', () => {
+    // direction reads the BURST-local flow, not the full-window drift.
+    // spike_3 is an HFT micro-trade burst: its peak window is two-way
+    // ping-pong (burstImbalance ≈ −0.27), more balanced than the window's
+    // −0.39 drift — the old 'short' here was an artifact of averaging slow
+    // drift into the burst.  Genuinely directional spikes sharpen instead
+    // (spike_1: −0.48 burst-local vs −0.42 full-window).
     const r = predict(spike3.historical, spike3.recent, 0.75, 0.3);
     expect(r.anomaly).toBe(true);
-    expect(r.direction).toBe('short');
+    expect(r.direction).toBe('neutral');
+    expect(r.burstImbalance).toBeGreaterThan(-0.3);
+    expect(r.burstImbalance).toBeLessThan(0);
   });
 
   it('spike_4 — direction=short at confidence 0.6', () => {
