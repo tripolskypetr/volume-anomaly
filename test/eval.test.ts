@@ -193,12 +193,19 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
 
       let r = det.detect(makeWindow(c, Math.max(fi, end - RECENT_MAX), end), CONF);
       let rr = 0, vr = 0; // peak fast-horizon robust z over calls (rate, vol)
+      const calls: Array<{ s: number; z: number[] }> = [];
       for (let e = Math.min(fi + RECENT_MAX, end); ; e += 150) {
         e = Math.min(e, end);
-        const rc = det.detect(makeWindow(c, Math.max(fi, e - RECENT_MAX), e), CONF);
+        const start = Math.max(fi, e - RECENT_MAX);
+        const rc = det.detect(makeWindow(c, start, e), CONF);
         if (rc.confidence > r.confidence) r = rc;
         rr = Math.max(rr, rc.stats.zRate, rc.stats.zRateSlow);
         vr = Math.max(vr, rc.stats.zVol,  rc.stats.zVolSlow);
+        const spanSec = (c.ts[e - 1]! - c.ts[start]!) / 1000;
+        calls.push({
+          s: Math.log10(Math.max(1, spanSec / m.slowHorizonSec)),
+          z: [rc.stats.zRate, rc.stats.zVol, rc.stats.zRateSlow, rc.stats.zVolSlow],
+        });
         if (e >= end) break;
       }
 
@@ -213,6 +220,14 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
         b, lab,
         h: r.scores.hawkes, c: r.scores.cusum, p: r.scores.bocpd,
         rr, vr, zv: zVol[b]!, zc: zCnt[b]!,
+        calls,
+        // Null quantile ladders [P50,P75,P80,P85,P90,P95,P97,P99] per channel
+        nq: [
+          m.channelCalib.rateFast.nullQ,
+          m.channelCalib.volFast.nullQ,
+          m.channelCalib.rateSlow.nullQ,
+          m.channelCalib.volSlow.nullQ,
+        ],
       });
 
       if (lab === 'strong') {
@@ -286,11 +301,12 @@ describe.runIf(RUN)('eval: full-day sweep on BTCUSDT-2025-03-01', () => {
       console.log(`per-bucket dump: ${dumpPath} (${rows.length} rows)`);
     }
 
-    // ── Benchmark gate (calibrated 2026-07: recall 86% / events 87% / FP 3.0%).
-    // If a change trips these, it made the detector measurably worse on real
-    // data — fix the change, not the thresholds.
-    expect(recall).toBeGreaterThanOrEqual(0.75);
-    expect(eventsCaught / events).toBeGreaterThanOrEqual(0.8);
-    expect(fpRate).toBeLessThanOrEqual(0.05);
+    // ── Benchmark gate (brute-force-calibrated 2026-07: recall 92.5% /
+    // events 95.2% / FP 2.45%).  If a change trips these, it made the
+    // detector measurably worse on real data — fix the change, not the
+    // thresholds.
+    expect(recall).toBeGreaterThanOrEqual(0.85);
+    expect(eventsCaught / events).toBeGreaterThanOrEqual(0.9);
+    expect(fpRate).toBeLessThanOrEqual(0.035);
   }, 600_000);
 });

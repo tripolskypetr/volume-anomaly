@@ -18,7 +18,7 @@ npm install volume-anomaly
 
 The library detects **abnormal surges in trade flow** — sudden acceleration of arrivals and volume waves — from a raw stream of aggregated trades. The direction of the trade must come from your own analysis (fundamental, technical). This library answers a narrower question: **is right now a statistically unusual moment in market microstructure?**
 
-The primary statistic is a **self-calibrated robust z-score of trade rate and volume rate**: the detector measures "trades per 5 s / per 30 s" and "quantity per 5 s / per 30 s" in the detection window and scores the peaks against the median/MAD of the same statistic over the training window — *how many robust σ above the recent typical level*. Thresholds are calibrated on a full day of real BTCUSDT aggTrades (1.49 M trades, see `test/eval.test.ts`): at the default `confidence = 0.75` the detector catches ≈ 90 % of locally-strong volume anomalies (robust z ≥ 8 vs the trailing hour) with ≈ 2.5 % false alarms on normal 30-second windows.
+The primary statistic is a **self-calibrated robust z-score of trade rate and volume rate**: the detector measures "trades per 5 s / per 30 s" and "quantity per 5 s / per 30 s" in the detection window and scores the peaks against the median/MAD of the same statistic over the training window — *how many robust σ above the recent typical level*. Thresholds are calibrated on a full day of real BTCUSDT aggTrades (1.49 M trades, see `test/eval.test.ts`): at the default `confidence = 0.75` the detector catches ≈ 92 % of locally-strong volume anomalies (robust z ≥ 8 vs the trailing hour) and ≈ 95 % of anomaly events, with ≈ 2.5 % false alarms on normal 30-second windows.
 
 Two secondary detectors (CUSUM and BOCPD on order-flow imbalance) are computed and reported in `scores`/`signals`, but by default carry **zero weight** in the combined confidence: on real data they track flow-regime shifts — a different phenomenon — and any additive weight on them measurably dilutes recall. Re-weight via `scoreWeights` if your use case targets flow shifts specifically.
 
@@ -226,17 +226,17 @@ score_final = w_H · score_volume + w_C · score_cusum + w_B · score_bocpd
 anomaly     = score_final >= confidence
 ```
 
-The volume-channel score is a sigmoid over the peak robust z of the rolling rate/volume statistics: `score = σ((z − c) · ln3/u)`. The level `c` and tail unit `u` are chosen **on the fly at `train()` time**: `c` = P90 of the peak-z values the baseline itself produced in alert-sized stretches (floored by a universal level validated on a full day of real BTCUSDT trades, `test/eval.test.ts`); `u` is universal in z-space. On a typical baseline this gives 0.5 ⇒ z ≈ 12, 0.75 ⇒ z ≈ 14.7, 0.9 ⇒ z ≈ 17.5; a hotter/noisier baseline automatically raises the bar.
+The volume-channel score is a sigmoid over the peak robust z of the rolling rate/volume statistics: `score = σ((z − c) · ln3/u)`. The level `c` is chosen **on the fly at `train()` time**: P85 of the peak-z values the baseline itself produced in alert-sized stretches, floored by per-channel universal levels found by dense brute-force search on a full day of real BTCUSDT trades (`test/eval.test.ts`): 14 for arrival-rate channels, 6.5 for volume channels (volume z separates anomalies much more cleanly, so it earns a lower bar). The tail unit `u = 5.5` is universal in z-space. On a typical baseline `confidence = 0.75` fires at volume z ≥ 12 or rate z ≥ 19.5; a hotter/noisier baseline automatically raises the bar.
 
 **Practical guidance** (measured on the real-data benchmark, 30 s buckets):
 
-| `confidence` | Fires at | Recall (strong anomalies) | False alarms (normal buckets) |
-|-------------|----------|---------------------------|-------------------------------|
-| `0.5` | z ≈ 12 | ≈ 92 % | ≈ 6.7 % |
-| `0.75` (default) | z ≈ 14.7 | ≈ 90 % | ≈ 2.5 % |
-| `0.9` | z ≈ 17.5 | ≈ 84 % | ≈ 1.5 % |
+| `confidence` | Fires at (vol / rate z) | Recall (strong anomalies) | False alarms (normal buckets) |
+|-------------|--------------------------|---------------------------|-------------------------------|
+| `0.5` | ≥ 6.5 / 14 | higher | higher |
+| `0.75` (default) | ≥ 12 / 19.5 | ≈ 92 % (events ≈ 95 %) | ≈ 2.5 % |
+| `0.9` | ≥ 17.5 / 25 | lower | ≈ 1.5 % |
 
-A result with `confidence = 0.74` at a threshold of `0.75` means the moment is borderline — the peak rate/volume sits just under ~15 robust σ above the recent typical level.
+A result with `confidence = 0.74` at a threshold of `0.75` means the moment is borderline — the peak volume/rate sits just under one tail unit beyond the calibrated level.
 
 ---
 
@@ -527,9 +527,10 @@ score_volume = max over channels of  σ((z − c_ch − u·spanShift) · ln3 / u
              z of peak "qty per slow horizon"      (sustained volume waves)
 
   z    = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median_train))
-  c_ch = max(P90 of the peak-z the baseline itself produced in slow-horizon
-             stretches, universal floor)                     → score 0.5
-  u    = universal tail unit; c_ch + u                        → score 0.75
+  c_ch = max(P85 of the peak-z the baseline itself produced in slow-horizon
+             stretches, universal per-channel floor:
+             14 for rate channels, 6.5 for volume channels)  → score 0.5
+  u    = 5.5 (universal tail unit); c_ch + u                  → score 0.75
   spanShift = log10(max(1, detectionSpan / slowHorizon))      (longer window ⇒
               more independent looks at the max ⇒ higher bar)
 
@@ -544,7 +545,7 @@ Everything instrument-specific is chosen **on the fly at `train()` time**:
 - **Yardstick (median/MAD)** — measured per channel on the training window.
 - **Score level `c_ch`** — the baseline's own null distribution of window maxima, floored by the universal mapping validated on a full day of real BTCUSDT trades. A baseline that itself contains recurring bursts absorbs them into its null quantiles, so a repeat of a known pattern scores ≈ 0.5 rather than 1.0.
 
-There are no theoretical thresholds ("2× the fitted μ", "5σ under i.i.d.") — those were tested on real data and misfire badly (28 % false alarms), because real trade streams are heavily autocorrelated and heavy-tailed. The two remaining fixed anchors (the universal floor level and tail unit) live in standardized z-space, were validated end-to-end on the benchmark, and act only as a sensitivity *limit* — the data can make the detector stricter, never more trigger-happy.
+There are no theoretical thresholds ("2× the fitted μ", "5σ under i.i.d.") — those were tested on real data and misfire badly (28 % false alarms), because real trade streams are heavily autocorrelated and heavy-tailed. The remaining fixed anchors (per-channel floor levels and the tail unit) live in standardized z-space, were found by a dense brute-force search over the full mapping space on the benchmark (44 100 configurations; the chosen point sits on a stable Pareto plateau), and act only as a sensitivity *limit* — the data can make the detector stricter, never more trigger-happy.
 
 **Signals** are individual detector firings appended to `result.signals` when:
 

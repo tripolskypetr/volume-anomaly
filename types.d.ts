@@ -275,7 +275,8 @@ interface RobustStats {
  *   each further u beyond that                            → 0.9, 0.96, …
  *
  * Both anchors are floored by the universal mapping validated on a full day
- * of real data (CALIB_FALLBACK): the baseline's own null distribution can
+ * of real data (CALIB_FALLBACK_RATE / CALIB_FALLBACK_VOL): the baseline's own
+ * null distribution can
  * only make the detector stricter (hot/noisy baseline ⇒ higher, wider
  * mapping), never more trigger-happy — a 15–30 min window yields too few
  * null stretches to trust a low estimate of the normal tail.
@@ -283,8 +284,14 @@ interface RobustStats {
 interface ChannelCalib {
     /** Score-0.5 level: max(null P90 of window maxima, universal floor) */
     c: number;
-    /** Tail unit: max(null P99 − P90, universal floor); one u beyond c ⇒ 0.75 */
+    /** Universal tail unit; one u beyond c ⇒ 0.75 */
     u: number;
+    /**
+     * Quantile ladder of the null window-maxima distribution
+     * [P50, P75, P80, P85, P90, P95, P97, P99] — exposed for introspection and
+     * threshold research (empty when the fallback mapping is in effect).
+     */
+    nullQ: number[];
 }
 declare class VolumeAnomalyDetector {
     private readonly cfg;
@@ -332,14 +339,15 @@ declare class VolumeAnomalyDetector {
      * window maxima on the training data.
      *
      * The training z-series is cut into sliding stretches of windowSec (the
-     * slow-horizon alert timescale), stepped by windowSec/4; the maximum z of
-     * each stretch is one null sample — "the worst this baseline does in one
-     * alert window".  The mapping anchors on the quantiles of those maxima:
-     * P99 → score 0.5, P99 + (P99−P90) → score 0.75.  No instrument-specific
-     * constants:
-     * a noisy instrument gets a wide mapping, a quiet one a tight mapping, and
-     * a baseline that itself contains recurring bursts absorbs them into its
-     * null quantiles (a repeat of a known pattern scores ≈ 0.5, not 1.0).
+     * slow-horizon alert timescale) at every offset multiple of windowSec/16;
+     * the maximum z of each stretch is one null sample — "the worst this
+     * baseline does in one alert window".  The fine step matters: coarse
+     * stepping quantizes window edges and a peak sitting at a boundary between
+     * coarse positions biases the null quantiles.  The mapping anchors on the
+     * quantiles of those maxima; a noisy instrument gets a higher level, a
+     * quiet one keeps the universal floor, and a baseline that itself contains
+     * recurring bursts absorbs them into its null quantiles (a repeat of a
+     * known pattern scores ≈ 0.5, not 1.0).
      *
      * Falls back to the fixed real-data calibration when the training span
      * yields fewer than 8 stretches.

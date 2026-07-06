@@ -37,12 +37,15 @@ slow = 6×fast, both capped by training span; config values = floors, explicit
 values pin them).
 z = (peak_detect − median_train) / (1.4826 · max(MAD_train, 0.1·median)).
 Score mapping per channel chosen at train(): score = σ((z − c − u·spanShift)·ln3/u),
-c = max(P90 of null window-maxima of the baseline itself, universal floor 12),
-u = universal tail unit ln3/0.4 ≈ 2.75, spanShift = log10(span/slowHorizon).
-Level-only adaptation is deliberate (measured): trusting low null quantiles
-raised FP; P99 anchor or adaptive u crushed escalating events (spike_2).
+c = max(P85 of null window-maxima of the baseline itself, per-channel floor:
+rate 14 / volume 6.5), u = 5.5 universal, spanShift = log10(span/slowHorizon).
+Floors/anchor/u found by dense brute force (44k configs) on the benchmark;
+the point sits on a stable Pareto plateau and dominates the previous
+single-floor mapping on all three metrics.  Level-only adaptation is
+deliberate (measured): trusting low null quantiles raised FP; P99 anchor or
+adaptive u crushed escalating events (spike_2).
 confidence = 1.0·score_volume + 0·cusum + 0·bocpd  (defaults [1,0,0])
-anomaly = confidence >= threshold (default 0.75 ⇒ fires at z ≈ c + 2.75).
+anomaly = confidence >= threshold (0.75 ⇒ fires at vol z ≥ 12 / rate z ≥ 19.5).
 
 CUSUM/BOCPD (on rolling |imbalance|) are flow-shift detectors: computed,
 self-calibrated (CUSUM h = max(5σ, 2× training excursion); BOCPD rescaled
@@ -58,8 +61,8 @@ last 2000 trades; imbalance series to the last 1000.
 ## Real-data benchmark (test/eval.test.ts, EVAL=1)
 Full day BTCUSDT 2025-03-01 (1.49M trades), 30s buckets, ground truth =
 robust z ≥ 8 vs trailing hour; sliding-window operational protocol.
-At confidence 0.75: bucket recall 90.3%, event recall 93.5%, FP 2.49%.
-The eval test asserts recall ≥ 0.75 / event recall ≥ 0.8 / FP ≤ 0.05 as a
+At confidence 0.75: bucket recall 92.5%, event recall 95.2%, FP 2.45%.
+The eval test asserts recall ≥ 0.85 / event recall ≥ 0.9 / FP ≤ 0.035 as a
 regression gate — if a change trips it, fix the change, not the thresholds.
 
 ## Tests (vitest, ~750 tests, 19 files) — ALL PASSING

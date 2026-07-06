@@ -192,7 +192,8 @@ function robustZ(x: number, s: RobustStats): number {
  *   each further u beyond that                            → 0.9, 0.96, …
  *
  * Both anchors are floored by the universal mapping validated on a full day
- * of real data (CALIB_FALLBACK): the baseline's own null distribution can
+ * of real data (CALIB_FALLBACK_RATE / CALIB_FALLBACK_VOL): the baseline's own
+ * null distribution can
  * only make the detector stricter (hot/noisy baseline ⇒ higher, wider
  * mapping), never more trigger-happy — a 15–30 min window yields too few
  * null stretches to trust a low estimate of the normal tail.
@@ -200,16 +201,35 @@ function robustZ(x: number, s: RobustStats): number {
 interface ChannelCalib {
   /** Score-0.5 level: max(null P90 of window maxima, universal floor) */
   c: number;
-  /** Tail unit: max(null P99 − P90, universal floor); one u beyond c ⇒ 0.75 */
+  /** Universal tail unit; one u beyond c ⇒ 0.75 */
   u: number;
+  /**
+   * Quantile ladder of the null window-maxima distribution
+   * [P50, P75, P80, P85, P90, P95, P97, P99] — exposed for introspection and
+   * threshold research (empty when the fallback mapping is in effect).
+   */
+  nullQ: number[];
 }
 
 /**
- * Fallback when the training span is too short to build a null distribution
- * (< ~2 alert windows).  Values reproduce the mapping measured on a full day
- * of real BTCUSDT aggTrades (σ((z − 12)·0.4), see test/eval.test.ts).
+ * Universal floor/fallback mappings, found by dense brute force over the
+ * (anchor quantile × rate floor × vol floor × tail unit) space on the
+ * real-data benchmark (test/eval.test.ts) and verified to sit on a stable
+ * plateau (±1–2 in any parameter moves metrics ≤ 1–2 points).
+ *
+ * Rate and volume channels get DIFFERENT floors because they separate
+ * differently on real data: peak volume z of normal windows stays low while
+ * anomalies reach z ≥ 13 (clean separation ⇒ low floor 6.5), whereas peak
+ * arrival-rate z of normal windows overlaps the anomaly range much more
+ * (⇒ high floor 14).  The tail unit u is shared.
+ *
+ * At the default confidence 0.75 (fires at z ≥ c + u) this means: volume
+ * z ≥ 12, arrival-rate z ≥ 19.5 — measured 95.2% event recall at 2.45%
+ * false alarms, dominating the previous single-floor mapping on all three
+ * benchmark metrics.
  */
-const CALIB_FALLBACK: ChannelCalib = { c: 12, u: Math.log(3) / 0.4 };
+const CALIB_FALLBACK_RATE: ChannelCalib = { c: 14,  u: 5.5, nullQ: [] };
+const CALIB_FALLBACK_VOL:  ChannelCalib = { c: 6.5, u: 5.5, nullQ: [] };
 
 // ─── Detector class ───────────────────────────────────────────────────────────
 
@@ -301,17 +321,23 @@ export class VolumeAnomalyDetector {
 
     // ── Score-mapping calibration from the null distribution: what peak z
     // does this baseline produce on its own, in alert-sized stretches?
-    const calib = (samples: number[], stats: RobustStats, firstIdx: number): ChannelCalib =>
+    const calib = (
+      samples:  number[],
+      stats:    RobustStats,
+      firstIdx: number,
+      fallback: ChannelCalib,
+    ): ChannelCalib =>
       this.calibrateChannel(
         samples.map((x) => robustZ(x, stats)),
         firstIdx >= 0 ? allTimestamps.slice(firstIdx) : [],
         slowHorizonSec,
+        fallback,
       );
     const channelCalib = {
-      rateFast: calib(fast.rates,    rateStats.fast, fast.firstIdx),
-      volFast:  calib(fast.volRates, volStats.fast,  fast.firstIdx),
-      rateSlow: calib(slow.rates,    rateStats.slow, slow.firstIdx),
-      volSlow:  calib(slow.volRates, volStats.slow,  slow.firstIdx),
+      rateFast: calib(fast.rates,    rateStats.fast, fast.firstIdx, CALIB_FALLBACK_RATE),
+      volFast:  calib(fast.volRates, volStats.fast,  fast.firstIdx, CALIB_FALLBACK_VOL),
+      rateSlow: calib(slow.rates,    rateStats.slow, slow.firstIdx, CALIB_FALLBACK_RATE),
+      volSlow:  calib(slow.volRates, volStats.slow,  slow.firstIdx, CALIB_FALLBACK_VOL),
     };
 
     // ── Hawkes: fit to trade arrival times (in seconds).
@@ -644,14 +670,15 @@ export class VolumeAnomalyDetector {
    * window maxima on the training data.
    *
    * The training z-series is cut into sliding stretches of windowSec (the
-   * slow-horizon alert timescale), stepped by windowSec/4; the maximum z of
-   * each stretch is one null sample — "the worst this baseline does in one
-   * alert window".  The mapping anchors on the quantiles of those maxima:
-   * P99 → score 0.5, P99 + (P99−P90) → score 0.75.  No instrument-specific
-   * constants:
-   * a noisy instrument gets a wide mapping, a quiet one a tight mapping, and
-   * a baseline that itself contains recurring bursts absorbs them into its
-   * null quantiles (a repeat of a known pattern scores ≈ 0.5, not 1.0).
+   * slow-horizon alert timescale) at every offset multiple of windowSec/16;
+   * the maximum z of each stretch is one null sample — "the worst this
+   * baseline does in one alert window".  The fine step matters: coarse
+   * stepping quantizes window edges and a peak sitting at a boundary between
+   * coarse positions biases the null quantiles.  The mapping anchors on the
+   * quantiles of those maxima; a noisy instrument gets a higher level, a
+   * quiet one keeps the universal floor, and a baseline that itself contains
+   * recurring bursts absorbs them into its null quantiles (a repeat of a
+   * known pattern scores ≈ 0.5, not 1.0).
    *
    * Falls back to the fixed real-data calibration when the training span
    * yields fewer than 8 stretches.
@@ -660,43 +687,53 @@ export class VolumeAnomalyDetector {
     zSamples:  number[],
     sampleTs:  number[],
     windowSec: number,
+    fallback:  ChannelCalib,
   ): ChannelCalib {
-    if (zSamples.length === 0 || zSamples.length !== sampleTs.length) return CALIB_FALLBACK;
-    const step = windowSec / 4;
+    if (zSamples.length === 0 || zSamples.length !== sampleTs.length) return fallback;
+    const SUB  = 16;            // sub-buckets per window
+    const step = windowSec / SUB;
     const t0   = sampleTs[0]!;
     const nBuckets = Math.floor((sampleTs[sampleTs.length - 1]! - t0) / step) + 1;
-    if (nBuckets < 8) return CALIB_FALLBACK;
+    if (nBuckets < 2 * SUB) return fallback;
 
-    // Max per step-bucket, then window max = max of 4 consecutive buckets.
+    // Max per step-bucket, then sliding window max = max of SUB consecutive
+    // buckets at every bucket offset (window length stays exactly windowSec).
     const bucketMax = new Array<number>(nBuckets).fill(-Infinity);
     for (let i = 0; i < zSamples.length; i++) {
       const b = Math.min(nBuckets - 1, Math.floor((sampleTs[i]! - t0) / step));
       if (zSamples[i]! > bucketMax[b]!) bucketMax[b] = zSamples[i]!;
     }
     const maxima: number[] = [];
-    for (let b = 0; b + 3 < nBuckets; b++) {
-      const m = Math.max(bucketMax[b]!, bucketMax[b + 1]!, bucketMax[b + 2]!, bucketMax[b + 3]!);
+    for (let b = 0; b + SUB - 1 < nBuckets; b++) {
+      let m = -Infinity;
+      for (let k = 0; k < SUB; k++) {
+        if (bucketMax[b + k]! > m) m = bucketMax[b + k]!;
+      }
       if (m !== -Infinity) maxima.push(m);
     }
-    if (maxima.length < 8) return CALIB_FALLBACK;
+    if (maxima.length < 8) return fallback;
 
-    const q90 = quantile(maxima, 90);
+    const nullQ = [50, 75, 80, 85, 90, 95, 97, 99].map((p) => quantile(maxima, p));
+    const q85 = nullQ[3]!;
     // Only the LEVEL adapts; the tail unit stays universal.  Measured on the
     // real-data benchmark:
     //  - the fallback level acts as a FLOOR, not just a fallback — a 15–30 min
     //    baseline yields only ~10² correlated null stretches, so its upper
     //    quantiles routinely UNDERestimate the true normal tail, and trusting
     //    a low estimate raised false alarms;
-    //  - anchoring the level at null P99 (instead of P90) crushed escalating
+    //  - anchoring the level at null P99 (instead of P85) crushed escalating
     //    events whose baseline was already hot (spike_2 fixture);
     //  - adapting the tail unit u to the null spread (P99 − P90) exploded on
     //    event-contaminated baselines (u ≈ 300) and flattened the mapping so
     //    much that z ≈ 190 scored only ≈ 0.65.
+    // The P85 anchor and the per-channel-type floors/tail unit come from the
+    // dense brute-force search (see CALIB_FALLBACK_RATE/_VOL).
     // So: quiet baselines get exactly the validated universal mapping; hot or
     // noisy baselines raise the level, with the universal tail unit on top.
     return {
-      c: Math.max(q90, CALIB_FALLBACK.c),
-      u: CALIB_FALLBACK.u,
+      c: Math.max(q85, fallback.c),
+      u: fallback.u,
+      nullQ,
     };
   }
 
