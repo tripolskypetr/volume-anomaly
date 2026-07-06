@@ -19,11 +19,23 @@ export interface IAggregatedTradeData {
 /** Trade direction inferred from order-flow imbalance. */
 export type Direction = 'long' | 'short' | 'neutral';
 
+/**
+ * Human-friendly bucketing of `confidence`, anchored to the score scale's
+ * own semantics (independent of the user's alert threshold):
+ * - `'none'`    — confidence < 0.5: below the calibrated level, routine market
+ * - `'notable'` — 0.5–0.75: above the level but within one tail unit
+ * - `'strong'`  — 0.75–0.9: 1–4 tail units beyond (default alerts fire here)
+ * - `'extreme'` — ≥ 0.9: 4+ tail units beyond the calibrated level
+ */
+export type Severity = 'none' | 'notable' | 'strong' | 'extreme';
+
 export interface PredictionResult {
   /** true when combined confidence ≥ requested threshold */
   anomaly:    boolean;
   /** Composite anomaly score [0,1] */
   confidence: number;
+  /** Human-friendly bucketing of confidence (see Severity) */
+  severity:   Severity;
   /**
    * Directional signal derived from imbalance:
    * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression);
@@ -69,6 +81,8 @@ export interface DetectionResult {
   anomaly:        boolean;
   /** Probability [0,1] that the current window contains an anomaly */
   confidence:     number;
+  /** Human-friendly bucketing of confidence (see Severity) */
+  severity:       Severity;
   /**
    * Raw sub-detector scores [0,1] regardless of signal thresholds.
    * confidence = scoreWeights · [hawkes, cusum, bocpd] (weights renormalized
@@ -93,6 +107,8 @@ export interface DetectionResult {
      */
     zRates:      number[];
     zVols:       number[];
+    /** The trained horizon family (seconds, ascending) that zRates/zVols index into */
+    horizonsSec: number[];
     /**
      * Compensator-excess z (time-rescaling channel): observed arrivals beyond
      * what the fitted Hawkes self-excitation explains at the fast horizon,

@@ -13,11 +13,22 @@ interface IAggregatedTradeData {
 }
 /** Trade direction inferred from order-flow imbalance. */
 type Direction = 'long' | 'short' | 'neutral';
+/**
+ * Human-friendly bucketing of `confidence`, anchored to the score scale's
+ * own semantics (independent of the user's alert threshold):
+ * - `'none'`    — confidence < 0.5: below the calibrated level, routine market
+ * - `'notable'` — 0.5–0.75: above the level but within one tail unit
+ * - `'strong'`  — 0.75–0.9: 1–4 tail units beyond (default alerts fire here)
+ * - `'extreme'` — ≥ 0.9: 4+ tail units beyond the calibrated level
+ */
+type Severity = 'none' | 'notable' | 'strong' | 'extreme';
 interface PredictionResult {
     /** true when combined confidence ≥ requested threshold */
     anomaly: boolean;
     /** Composite anomaly score [0,1] */
     confidence: number;
+    /** Human-friendly bucketing of confidence (see Severity) */
+    severity: Severity;
     /**
      * Directional signal derived from imbalance:
      * - `'long'`    — anomaly + imbalance >  imbalanceThreshold (buy aggression);
@@ -54,6 +65,8 @@ interface DetectionResult {
     anomaly: boolean;
     /** Probability [0,1] that the current window contains an anomaly */
     confidence: number;
+    /** Human-friendly bucketing of confidence (see Severity) */
+    severity: Severity;
     /**
      * Raw sub-detector scores [0,1] regardless of signal thresholds.
      * confidence = scoreWeights · [hawkes, cusum, bocpd] (weights renormalized
@@ -82,6 +95,8 @@ interface DetectionResult {
          */
         zRates: number[];
         zVols: number[];
+        /** The trained horizon family (seconds, ascending) that zRates/zVols index into */
+        horizonsSec: number[];
         /**
          * Compensator-excess z (time-rescaling channel): observed arrivals beyond
          * what the fitted Hawkes self-excitation explains at the fast horizon,
@@ -341,6 +356,10 @@ interface TrainedModels {
      */
     excessStats: RobustStats;
     excessCalib: ChannelCalib;
+    /** Wall-clock span of the training window (seconds) — for calibrationReport */
+    trainingSpanSec: number;
+    /** Trade count of the training window — for calibrationReport */
+    trainingTrades: number;
 }
 /** Robust location/scale: median + MAD. */
 interface RobustStats {
@@ -375,6 +394,32 @@ interface ChannelCalib {
      * mapping is in effect).
      */
     nullQ: number[];
+}
+/** Bucketing of confidence into Severity (see types.ts for the semantics). */
+declare function severityOf(confidence: number): Severity;
+/**
+ * Plain-language assessment of how well the detector could self-calibrate on
+ * the training data it was given — surfaced so that silent fallback to the
+ * universal mapping (short/sparse baselines) is visible without inspecting
+ * null quantile ladders.
+ */
+interface CalibrationReport {
+    /**
+     * 'calibrated' — every channel calibrated its own null distribution;
+     * 'partial'    — some channels fell back to the universal mapping;
+     * 'fallback'   — all channels on universal floors (detector still works,
+     *                using the mapping validated on a full day of real data,
+     *                but is not adapted to THIS instrument's baseline).
+     */
+    quality: 'calibrated' | 'partial' | 'fallback';
+    /** Wall-clock span of the training window, seconds */
+    trainingSpanSec: number;
+    trainingTrades: number;
+    /** Channels that calibrated their own null vs total (rate+vol per scale) */
+    channelsCalibrated: number;
+    channelsTotal: number;
+    /** Human-readable observations + what to do about them */
+    notes: string[];
 }
 /**
  * JSON-friendly snapshot of a detector: configuration + trained models.
@@ -486,6 +531,13 @@ declare class VolumeAnomalyDetector {
      */
     static fromJSON(snapshot: DetectorSnapshot | string): VolumeAnomalyDetector;
     get isTrained(): boolean;
+    /**
+     * Plain-language calibration health of the trained detector.  Self-
+     * calibration silently falls back to the universal mapping when the
+     * baseline is too short or sparse — this getter makes that visible and
+     * says what to do about it.  Throws before train().
+     */
+    get calibrationReport(): CalibrationReport;
     /** Expose fitted parameters (for debugging / serialization) */
     get trainedModels(): Readonly<TrainedModels> | null;
 }
@@ -542,6 +594,46 @@ declare function detect(historical: IAggregatedTradeData[], recent: IAggregatedT
  *                            symmetric ±max(0, thr)). Omit to use p75 from training.
  */
 declare function predict(historical: IAggregatedTradeData[], recent: IAggregatedTradeData[], confidence?: number, imbalanceThreshold?: number): PredictionResult;
+/** Result of scan(): full detection output plus the directional signal. */
+type ScanResult = DetectionResult & {
+    direction: Direction;
+};
+interface ScanOptions extends DetectorConfig {
+    /**
+     * How much trailing market time (seconds) to evaluate as the "recent"
+     * window; everything before it trains the baseline.  Default 30 s (the
+     * alert timescale).
+     */
+    recentSec?: number;
+    /** Anomaly threshold [0,1]. Default 0.75. */
+    confidence?: number;
+}
+/**
+ * One-call scan of a single trade stream — no manual historical/recent
+ * slicing (the #1 integration mistake: overlapping windows absorb the very
+ * anomaly being detected into the baseline).
+ *
+ * The stream is split by TIME: the last `recentSec` seconds are evaluated,
+ * everything before trains the baseline.  When the tail is nearly empty
+ * (quiet market), the recent window extends to the last 20 trades so there
+ * is always something to evaluate.
+ *
+ * @example
+ * ```typescript
+ * const r = scan(trades);          // trades = last 15–30+ min, oldest first
+ * if (r.anomaly) console.log(explain(r));
+ * ```
+ */
+declare function scan(trades: IAggregatedTradeData[], options?: ScanOptions): ScanResult;
+/**
+ * Plain-language explanation of a detection result — what happened, how
+ * unusual it is, who drove it, and how to read the numbers.  Accepts both
+ * DetectionResult/ScanResult (full detail) and PredictionResult (summary).
+ *
+ * @param result     Output of detect(), scan() or predict().
+ * @param threshold  The alert threshold the caller uses (for context). Default 0.75.
+ */
+declare function explain(result: DetectionResult | PredictionResult | ScanResult, threshold?: number): string;
 
-export { VolumeAnomalyDetector, detect, predict };
-export type { AnomalyKind, AnomalySignal, DetectionResult, DetectorConfig, DetectorSnapshot, Direction, IAggregatedTradeData, PredictionResult, TrainedModels };
+export { VolumeAnomalyDetector, detect, explain, predict, scan, severityOf };
+export type { AnomalyKind, AnomalySignal, CalibrationReport, DetectionResult, DetectorConfig, DetectorSnapshot, Direction, IAggregatedTradeData, PredictionResult, ScanOptions, ScanResult, Severity, TrainedModels };

@@ -18,8 +18,8 @@
  * ```
  */
 
-export { VolumeAnomalyDetector } from './detector.js';
-export type { DetectorConfig, DetectorSnapshot, TrainedModels } from './detector.js';
+export { VolumeAnomalyDetector, severityOf } from './detector.js';
+export type { DetectorConfig, DetectorSnapshot, TrainedModels, CalibrationReport } from './detector.js';
 
 export type {
   IAggregatedTradeData,
@@ -27,12 +27,14 @@ export type {
   AnomalySignal,
   AnomalyKind,
   Direction,
+  Severity,
   PredictionResult,
 } from './types.js';
 
 // ─── Functional one-shot API ──────────────────────────────────────────────────
 
-import { VolumeAnomalyDetector } from './detector.js';
+import { VolumeAnomalyDetector, severityOf } from './detector.js';
+import type { DetectorConfig } from './detector.js';
 import type { IAggregatedTradeData, DetectionResult, Direction, PredictionResult } from './types.js';
 
 /**
@@ -104,9 +106,142 @@ export function predict(
   return {
     anomaly:        r.anomaly,
     confidence:     r.confidence,
+    severity:       r.severity,
     direction,
     imbalance:      r.imbalance,
     burstImbalance: r.burstImbalance,
     moveScore:      r.moveScore,
   };
+}
+
+// ─── Convenience API for non-specialists ──────────────────────────────────────
+
+/** Result of scan(): full detection output plus the directional signal. */
+export type ScanResult = DetectionResult & { direction: Direction };
+
+export interface ScanOptions extends DetectorConfig {
+  /**
+   * How much trailing market time (seconds) to evaluate as the "recent"
+   * window; everything before it trains the baseline.  Default 30 s (the
+   * alert timescale).
+   */
+  recentSec?:  number;
+  /** Anomaly threshold [0,1]. Default 0.75. */
+  confidence?: number;
+}
+
+/**
+ * One-call scan of a single trade stream — no manual historical/recent
+ * slicing (the #1 integration mistake: overlapping windows absorb the very
+ * anomaly being detected into the baseline).
+ *
+ * The stream is split by TIME: the last `recentSec` seconds are evaluated,
+ * everything before trains the baseline.  When the tail is nearly empty
+ * (quiet market), the recent window extends to the last 20 trades so there
+ * is always something to evaluate.
+ *
+ * @example
+ * ```typescript
+ * const r = scan(trades);          // trades = last 15–30+ min, oldest first
+ * if (r.anomaly) console.log(explain(r));
+ * ```
+ */
+export function scan(
+  trades:  IAggregatedTradeData[],
+  options: ScanOptions = {},
+): ScanResult {
+  const { recentSec = 30, confidence = 0.75, ...config } = options;
+  if (!(recentSec > 0) || !Number.isFinite(recentSec)) {
+    throw new Error(`recentSec must be a finite number > 0, got ${recentSec}`);
+  }
+  const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
+  const cutoff = sorted.length > 0
+    ? sorted[sorted.length - 1]!.timestamp - recentSec * 1000
+    : 0;
+  let split = sorted.findIndex((t) => t.timestamp > cutoff);
+  if (split < 0) split = sorted.length;
+  // Quiet tail: make sure the recent window has something to evaluate
+  if (sorted.length - split < 20) split = Math.max(0, sorted.length - 20);
+  const historical = sorted.slice(0, split);
+  if (historical.length < 50) {
+    throw new Error(
+      `scan() needs >= 50 baseline trades before the recent window, got ${historical.length}; ` +
+      `feed 15-30 minutes of trades (recent window = last ${recentSec}s)`,
+    );
+  }
+  const detector = new VolumeAnomalyDetector(config);
+  detector.train(historical);
+  const r   = detector.detect(sorted.slice(split), confidence);
+  const thr = Math.max(0, detector.trainedModels!.imbalanceThreshold);
+  let direction: Direction = 'neutral';
+  if (r.anomaly) {
+    if (r.burstImbalance >  thr) direction = 'long';
+    else if (r.burstImbalance < -thr) direction = 'short';
+  }
+  return { ...r, direction };
+}
+
+/**
+ * Plain-language explanation of a detection result — what happened, how
+ * unusual it is, who drove it, and how to read the numbers.  Accepts both
+ * DetectionResult/ScanResult (full detail) and PredictionResult (summary).
+ *
+ * @param result     Output of detect(), scan() or predict().
+ * @param threshold  The alert threshold the caller uses (for context). Default 0.75.
+ */
+export function explain(
+  result:    DetectionResult | PredictionResult | ScanResult,
+  threshold: number = 0.75,
+): string {
+  const lines: string[] = [];
+  const sev = result.severity ?? severityOf(result.confidence);
+  lines.push(
+    (result.anomaly
+      ? `Volume anomaly detected (severity: ${sev})`
+      : `No anomaly (severity: ${sev})`) +
+    ` — confidence ${result.confidence.toFixed(2)} vs alert threshold ${threshold.toFixed(2)}.`,
+  );
+
+  if ('stats' in result) {
+    const { zRates, zVols, horizonsSec } = result.stats;
+    let bestZ = 0, bestScale = 0, bestType: 'trade rate' | 'volume' = 'volume';
+    for (let k = 0; k < horizonsSec.length; k++) {
+      if ((zRates[k] ?? 0) > bestZ) { bestZ = zRates[k]!; bestScale = horizonsSec[k]!; bestType = 'trade rate'; }
+      if ((zVols[k]  ?? 0) > bestZ) { bestZ = zVols[k]!;  bestScale = horizonsSec[k]!; bestType = 'volume'; }
+    }
+    if (bestZ > 0) {
+      lines.push(
+        `Strongest signal: ${bestType} ran ~${bestZ.toFixed(0)} robust sigma above the ` +
+        `recent typical level at the ${bestScale.toFixed(0)}s scale.`,
+      );
+    }
+    if (result.peakTs > 0) {
+      lines.push(`Peak at ${new Date(result.peakTs).toISOString()}.`);
+    }
+    const buyShare = (1 + result.burstImbalance) / 2;
+    if (Math.abs(result.burstImbalance) >= 0.2) {
+      lines.push(
+        `Order flow at the peak: ${(100 * Math.max(buyShare, 1 - buyShare)).toFixed(0)}% ` +
+        `${result.burstImbalance > 0 ? 'buy' : 'sell'}-side.`,
+      );
+    } else {
+      lines.push('Order flow at the peak: roughly balanced.');
+    }
+  }
+
+  const move = result.moveScore;
+  lines.push(
+    `Follow-through ranking (moveScore): ${move.toFixed(2)} — ` +
+    (move >= 0.75 ? 'top-tier; historically precedes real price movement more often than most alerts.'
+      : move >= 0.5 ? 'moderate.'
+      : 'low; likely routine even if flagged.'),
+  );
+
+  if ('direction' in result && result.direction !== 'neutral') {
+    lines.push(
+      `Dominant side: ${result.direction === 'long' ? 'buyers' : 'sellers'} drove the burst. ` +
+      'Note: direction describes the event; measured on real data it does NOT predict the sign of the next move.',
+    );
+  }
+  return lines.join('\n');
 }

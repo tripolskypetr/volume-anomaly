@@ -14,6 +14,48 @@
 npm install volume-anomaly
 ```
 
+## Quickstart (no math required)
+
+Feed 15–30 minutes of trades (oldest first) into one call and read the answer in plain language — `scan()` splits baseline/recent by time itself, so there is nothing to slice and nothing to get wrong:
+
+```typescript
+import { scan, explain } from 'volume-anomaly';
+
+const result = scan(trades);       // trades: last 15–30+ min, oldest first
+
+if (result.anomaly) {
+  console.log(explain(result));
+  // Volume anomaly detected (severity: extreme) — confidence 0.97 vs alert threshold 0.75.
+  // Strongest signal: volume ran ~81 robust sigma above the recent typical level at the 5s scale.
+  // Peak at 2025-03-01T07:06:10.323Z.
+  // Order flow at the peak: 74% sell-side.
+  // Follow-through ranking (moveScore): 0.92 — top-tier; historically precedes real price movement...
+}
+
+switch (result.severity) {        // 'none' | 'notable' | 'strong' | 'extreme'
+  case 'extreme': /* page someone */ break;
+  case 'strong':  /* alert */        break;
+}
+```
+
+Runnable on real data committed to this repo: `node examples/quickstart.mjs`.
+
+**Field glossary — what the numbers mean in plain words:**
+
+| Field | Plain meaning |
+|-------|---------------|
+| `confidence` | How unusual this moment is, 0–1. Alert when ≥ your threshold (default 0.75) |
+| `severity` | The same as an enum: `none` / `notable` / `strong` / `extreme` |
+| `moveScore` | How strongly moments like this have historically preceded actual price movement. Use to rank/prioritize alerts, not as the alert itself |
+| `direction` | Which side *drove* the burst (`long` = buyers). Describes the event; measured on real data it does **not** predict the next move's direction |
+| `burstImbalance` | Buy/sell balance inside the burst itself, −1 (all sells) … +1 (all buys) |
+| `peakTs` | When the anomaly peaked (Unix ms) |
+| `stats.zVol` / `zRate` | How many "sigmas" volume / trade-arrival rate ran above what was typical recently, per time scale |
+| `hawkesLambda` | Instantaneous trade-arrival intensity under the fitted model |
+| `runLength` / `cusumStat` | How long since the order-flow regime last changed / accumulated drift evidence |
+
+`detector.calibrationReport` tells you (in words) whether the detector could adapt to *your* data or is running on universal defaults, and what to feed it to fix that.
+
 ## Overview
 
 The library detects **abnormal surges in trade flow** — sudden acceleration of arrivals and volume waves — from a raw stream of aggregated trades. The direction of the trade must come from your own analysis (fundamental, technical). This library answers a narrower question: **is right now a statistically unusual moment in market microstructure?**
@@ -182,6 +224,10 @@ if (result.anomaly) {
 `predict()` trains a fresh detector on every call. For continuous monitoring (many `detect()` calls from one trained model) use `VolumeAnomalyDetector` directly — see the class API below.
 
 ---
+
+### `scan(trades, options?)` / `explain(result, threshold?)`
+
+The no-slicing convenience layer (see Quickstart). `scan(trades, { recentSec?, confidence?, ...DetectorConfig })` sorts the stream, evaluates the last `recentSec` seconds (default 30) against a baseline trained on everything before — overlap is impossible by construction; throws a clear error when fewer than 50 baseline trades remain. Returns `DetectionResult & { direction }`. `explain()` renders any result (`detect`/`scan`/`predict`) as plain-language lines: verdict + severity, the strongest channel and scale, peak time, order flow at the peak, and how to read `moveScore`/`direction`.
 
 ### `new VolumeAnomalyDetector(config?)`
 

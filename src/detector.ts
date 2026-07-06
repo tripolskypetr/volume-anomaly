@@ -10,7 +10,7 @@
  * For unit testing, import individual functions from '#math'.
  */
 
-import type { IAggregatedTradeData, DetectionResult, AnomalySignal } from './types.js';
+import type { IAggregatedTradeData, DetectionResult, AnomalySignal, Severity } from './types.js';
 import type { NormalGammaPrior }                 from './math/bocpd.js';
 import type { HawkesParams }                     from './types.js';
 import type { CusumState }                       from './types.js';
@@ -164,6 +164,10 @@ export interface TrainedModels {
    */
   excessStats:         RobustStats;
   excessCalib:         ChannelCalib;
+  /** Wall-clock span of the training window (seconds) — for calibrationReport */
+  trainingSpanSec:     number;
+  /** Trade count of the training window — for calibrationReport */
+  trainingTrades:      number;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -354,6 +358,39 @@ const NONCANONICAL_FLOOR_MULT = 1.15;
  */
 const MAX_CALIB_BUCKETS = 1_000_000;
 
+/** Bucketing of confidence into Severity (see types.ts for the semantics). */
+export function severityOf(confidence: number): Severity {
+  if (confidence >= 0.9)  return 'extreme';
+  if (confidence >= 0.75) return 'strong';
+  if (confidence >= 0.5)  return 'notable';
+  return 'none';
+}
+
+/**
+ * Plain-language assessment of how well the detector could self-calibrate on
+ * the training data it was given — surfaced so that silent fallback to the
+ * universal mapping (short/sparse baselines) is visible without inspecting
+ * null quantile ladders.
+ */
+export interface CalibrationReport {
+  /**
+   * 'calibrated' — every channel calibrated its own null distribution;
+   * 'partial'    — some channels fell back to the universal mapping;
+   * 'fallback'   — all channels on universal floors (detector still works,
+   *                using the mapping validated on a full day of real data,
+   *                but is not adapted to THIS instrument's baseline).
+   */
+  quality:            'calibrated' | 'partial' | 'fallback';
+  /** Wall-clock span of the training window, seconds */
+  trainingSpanSec:    number;
+  trainingTrades:     number;
+  /** Channels that calibrated their own null vs total (rate+vol per scale) */
+  channelsCalibrated: number;
+  channelsTotal:      number;
+  /** Human-readable observations + what to do about them */
+  notes:              string[];
+}
+
 // ─── Serialization ────────────────────────────────────────────────────────────
 
 /**
@@ -386,7 +423,7 @@ const MODEL_KEYS: readonly (keyof TrainedModels)[] = [
   'hawkesParams', 'cusumParams', 'bocpdPrior', 'imbalanceThreshold',
   'rateStats', 'volStats', 'fastHorizonSec', 'slowHorizonSec',
   'channelCalib', 'lambdaBaseline', 'bocpdNoiseFloor',
-  'excessStats', 'excessCalib',
+  'excessStats', 'excessCalib', 'trainingSpanSec', 'trainingTrades',
 ];
 
 /**
@@ -716,6 +753,8 @@ export class VolumeAnomalyDetector {
       bocpdNoiseFloor,
       excessStats,
       excessCalib,
+      trainingSpanSec: spanSec,
+      trainingTrades:  sorted.length,
     };
   }
 
@@ -990,8 +1029,9 @@ export class VolumeAnomalyDetector {
     return {
       anomaly:      combined >= confidence,
       confidence:   combined,
+      severity:     severityOf(combined),
       scores:       { hawkes: hawkesScore, cusum: cusumScore, bocpd: bocpdScore },
-      stats:        { zRate, zVol, zRateSlow, zVolSlow, lambdaRatio, zRates, zVols, zExcess },
+      stats:        { zRate, zVol, zRateSlow, zVolSlow, lambdaRatio, zRates, zVols, horizonsSec: [...horizonsSec], zExcess },
       signals,
       imbalance,
       burstImbalance,
@@ -1181,8 +1221,9 @@ export class VolumeAnomalyDetector {
     return {
       anomaly:      false,
       confidence:   0,
+      severity:     'none',
       scores:       { hawkes: 0, cusum: 0, bocpd: 0 },
-      stats:        { zRate: 0, zVol: 0, zRateSlow: 0, zVolSlow: 0, lambdaRatio: 0, zRates: [], zVols: [], zExcess: 0 },
+      stats:        { zRate: 0, zVol: 0, zRateSlow: 0, zVolSlow: 0, lambdaRatio: 0, zRates: [], zVols: [], horizonsSec: [], zExcess: 0 },
       signals:      [],
       imbalance:    0,
       burstImbalance: 0,
@@ -1250,6 +1291,52 @@ export class VolumeAnomalyDetector {
 
   get isTrained(): boolean {
     return this.models !== null;
+  }
+
+  /**
+   * Plain-language calibration health of the trained detector.  Self-
+   * calibration silently falls back to the universal mapping when the
+   * baseline is too short or sparse — this getter makes that visible and
+   * says what to do about it.  Throws before train().
+   */
+  get calibrationReport(): CalibrationReport {
+    if (!this.models) throw new Error('Call train() before calibrationReport');
+    const m = this.models;
+    const calibs = [...m.channelCalib.rate, ...m.channelCalib.vol];
+    const calibrated = calibs.filter((c) => c.nullQ.length > 0).length;
+    const notes: string[] = [];
+    const spanMin = m.trainingSpanSec / 60;
+    if (m.trainingSpanSec < 900) {
+      notes.push(
+        `training span is ${spanMin.toFixed(1)} min — recommend feeding 15–30 min ` +
+        `of market time so the score mapping can calibrate to this instrument`,
+      );
+    }
+    if (calibrated === 0) {
+      notes.push(
+        'all channels use the universal fallback mapping (validated on real ' +
+        'BTCUSDT data, but not adapted to this baseline)',
+      );
+    } else if (calibrated < calibs.length) {
+      notes.push(
+        `${calibs.length - calibrated} of ${calibs.length} channels fell back ` +
+        'to the universal mapping (usually the longer horizons on a short baseline)',
+      );
+    }
+    if (m.trainingTrades / Math.max(m.trainingSpanSec, 1) < 0.05) {
+      notes.push(
+        'very sparse stream (< 3 trades/min) — horizons were auto-scaled up; ' +
+        'detection works but reacts on longer timescales',
+      );
+    }
+    return {
+      quality: calibrated === calibs.length ? 'calibrated' : calibrated > 0 ? 'partial' : 'fallback',
+      trainingSpanSec:    m.trainingSpanSec,
+      trainingTrades:     m.trainingTrades,
+      channelsCalibrated: calibrated,
+      channelsTotal:      calibs.length,
+      notes,
+    };
   }
 
   /** Expose fitted parameters (for debugging / serialization) */
